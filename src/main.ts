@@ -18,6 +18,13 @@ const KNOWN_FLAGS = [
   // Value-args for `list`.
   "--limit",
   "--cursor",
+  // Value-args for mutations.
+  "--job-id",
+  "--expected-revision",
+  // Value-args for `continue`.
+  "--instructions",
+  // Value-args for `wait`.
+  "--timeout",
 ];
 
 /**
@@ -47,6 +54,31 @@ const VERB_TABLE: Record<string, VerbSpec> = {
     verbs: ["list"],
     valueArgs: ["--limit", "--cursor"],
     boolFlags: ["--include-archived"],
+  },
+  cancel: {
+    verbs: ["cancel"],
+    valueArgs: ["--job-id", "--expected-revision"],
+    boolFlags: [],
+  },
+  archive: {
+    verbs: ["archive"],
+    valueArgs: ["--job-id", "--expected-revision"],
+    boolFlags: [],
+  },
+  clean: {
+    verbs: ["clean"],
+    valueArgs: ["--job-id", "--expected-revision"],
+    boolFlags: [],
+  },
+  wait: {
+    verbs: ["wait"],
+    valueArgs: ["--job-id", "--timeout"],
+    boolFlags: [],
+  },
+  continue: {
+    verbs: ["continue"],
+    valueArgs: ["--job-id", "--expected-revision", "--instructions"],
+    boolFlags: [],
   },
 };
 
@@ -186,6 +218,12 @@ export function run(argv: string[]): Envelope {
     if (!parsed.ok) return parsed.envelope;
     return problemEnvelope("invalid-input", "list requires async; use bin/fleet");
   }
+  // Mutation and wait verbs need the store — sync surface directs to async.
+  for (const asyncVerb of ["cancel", "archive", "clean", "wait", "continue"]) {
+    if (verb === asyncVerb) {
+      return problemEnvelope("invalid-input", `${verb} requires async; use bin/fleet`);
+    }
+  }
   return problemEnvelope("invalid-input", `unknown verb: ${verb}`);
 }
 
@@ -321,6 +359,118 @@ function parseListArgsFromSplit(split: ReturnType<typeof splitArgs>): ParseResul
   };
 }
 
+interface MutationArgs {
+  jobId: string;
+  expectedRevision: number;
+}
+
+interface WaitArgs {
+  jobId: string;
+  timeoutMs: number | undefined;
+}
+
+interface ContinueArgs {
+  jobId: string;
+  expectedRevision: number;
+  instructions: string;
+}
+
+/**
+ * Parse the shared `--job-id` and `--expected-revision` flags from a split
+ * argument list. Returns the parsed pair or a problem envelope.
+ */
+function parseJobIdAndRevision(
+  split: ReturnType<typeof splitArgs>,
+): ParseResult<{ jobId: string; expectedRevision: number }> {
+  if (split.error !== undefined) {
+    return { ok: false, envelope: problemEnvelope("invalid-input", split.error) };
+  }
+  if (split.positionals.length > 0) {
+    return {
+      ok: false,
+      envelope: problemEnvelope("invalid-input", `unexpected positional argument: ${split.positionals[0]}`),
+    };
+  }
+  const values = split.valueMap;
+  const jobId = values["--job-id"];
+  if (typeof jobId !== "string") {
+    return { ok: false, envelope: problemEnvelope("invalid-input", "--job-id is required") };
+  }
+  if (!isValidUlid(jobId)) {
+    return { ok: false, envelope: problemEnvelope("invalid-input", `invalid job id: ${jobId}`) };
+  }
+  const rawRevision = values["--expected-revision"];
+  if (typeof rawRevision !== "string") {
+    return { ok: false, envelope: problemEnvelope("invalid-input", "--expected-revision is required") };
+  }
+  if (!/^[1-9][0-9]*$/.test(rawRevision)) {
+    return {
+      ok: false,
+      envelope: problemEnvelope("invalid-input", `--expected-revision must be a positive integer, got "${rawRevision}"`),
+    };
+  }
+  return {
+    ok: true,
+    value: { jobId, expectedRevision: Number(rawRevision) },
+  };
+}
+
+function parseMutationArgsFromSplit(
+  split: ReturnType<typeof splitArgs>,
+): ParseResult<MutationArgs> {
+  return parseJobIdAndRevision(split);
+}
+
+function parseWaitArgsFromSplit(
+  split: ReturnType<typeof splitArgs>,
+): ParseResult<WaitArgs> {
+  if (split.error !== undefined) {
+    return { ok: false, envelope: problemEnvelope("invalid-input", split.error) };
+  }
+  if (split.positionals.length > 0) {
+    return {
+      ok: false,
+      envelope: problemEnvelope("invalid-input", `unexpected positional argument: ${split.positionals[0]}`),
+    };
+  }
+  const values = split.valueMap;
+  const jobId = values["--job-id"];
+  if (typeof jobId !== "string") {
+    return { ok: false, envelope: problemEnvelope("invalid-input", "--job-id is required") };
+  }
+  if (!isValidUlid(jobId)) {
+    return { ok: false, envelope: problemEnvelope("invalid-input", `invalid job id: ${jobId}`) };
+  }
+  let timeoutMs: number | undefined;
+  const rawTimeout = values["--timeout"];
+  if (rawTimeout !== undefined) {
+    if (!/^[0-9]+$/.test(rawTimeout) || rawTimeout === "0") {
+      return {
+        ok: false,
+        envelope: problemEnvelope("invalid-input", `--timeout must be a positive integer (ms), got "${rawTimeout}"`),
+      };
+    }
+    timeoutMs = Number(rawTimeout);
+  }
+  return { ok: true, value: { jobId, timeoutMs } };
+}
+
+function parseContinueArgsFromSplit(
+  split: ReturnType<typeof splitArgs>,
+): ParseResult<ContinueArgs> {
+  const base = parseJobIdAndRevision(split);
+  if (!base.ok) return base;
+  const values = split.valueMap;
+  const instructions = values["--instructions"];
+  if (typeof instructions !== "string") {
+    return { ok: false, envelope: problemEnvelope("invalid-input", "--instructions is required") };
+  }
+  return {
+    ok: true,
+    value: { ...base.value, instructions },
+  };
+}
+
 /** Convert an `Outcome<T>` to the flat envelope shape the CLI prints. */
 function outcomeToEnvelope<T extends object>(outcome: {
   ok: true; value: T;
@@ -430,6 +580,32 @@ export async function runAsync(argv: string[]): Promise<Envelope> {
       cursor: parsed.value.cursor,
       includeArchived: parsed.value.includeArchived,
     });
+    return outcomeToEnvelope(outcome);
+  }
+  if (verb === "cancel" || verb === "archive" || verb === "clean") {
+    const afterVerb = stripVerb(args, verb);
+    const parsed = parseMutationArgsFromSplit(splitArgs(afterVerb));
+    if (!parsed.ok) return parsed.envelope;
+    const outcome =
+      verb === "cancel"
+        ? await fleet.cancel(parsed.value)
+        : verb === "archive"
+          ? await fleet.archive(parsed.value)
+          : await fleet.clean(parsed.value);
+    return outcomeToEnvelope(outcome);
+  }
+  if (verb === "wait") {
+    const afterVerb = stripVerb(args, verb);
+    const parsed = parseWaitArgsFromSplit(splitArgs(afterVerb));
+    if (!parsed.ok) return parsed.envelope;
+    const outcome = await fleet.wait(parsed.value);
+    return outcomeToEnvelope(outcome);
+  }
+  if (verb === "continue") {
+    const afterVerb = stripVerb(args, verb);
+    const parsed = parseContinueArgsFromSplit(splitArgs(afterVerb));
+    if (!parsed.ok) return parsed.envelope;
+    const outcome = await fleet.continue(parsed.value);
     return outcomeToEnvelope(outcome);
   }
   return problemEnvelope("invalid-input", `unknown verb: ${verb}`);

@@ -1,8 +1,10 @@
+import * as fs from "node:fs/promises";
+import { join } from "node:path";
 import type { Problem } from "./envelope.ts";
-import type { JobStatus, RiskClass } from "./store/records.ts";
+import type { JobRecord, JobStatus, RiskClass } from "./store/records.ts";
 import type { StoreOutcome } from "./store/job-store.ts";
 import { JobStore, hashIdempotencyKey, Paths } from "./store/job-store.ts";
-import { createUlidGenerator } from "./ulid.ts";
+import { createUlidGenerator, isValidUlid } from "./ulid.ts";
 import { resolveRepoRealpath } from "./store/paths.ts";
 
 /**
@@ -71,6 +73,40 @@ export interface SubmitRequest {
   risk: RiskClass;
   idempotencyKey?: string;
   overrides?: Record<string, unknown>;
+}
+
+/**
+ * A mutation request carrying the job id and the revision the caller
+ * last observed. Every mutation after submit requires both; a stale
+ * revision returns `conflict`.
+ */
+export interface MutationRequest {
+  jobId: string;
+  expectedRevision: number;
+}
+
+/**
+ * A wait request. Read-only — no revision, no lease. Blocks up to
+ * `timeoutMs` (clamped to 60s) and wakes on terminal states.
+ */
+export interface WaitRequest {
+  jobId: string;
+  timeoutMs?: number;
+}
+
+/**
+ * A continuation request carrying the primary's explicit instructions.
+ * Never triggers a silent retry or weakens acceptance.
+ */
+export interface ContinuationRequest {
+  jobId: string;
+  expectedRevision: number;
+  instructions: string;
+}
+
+/** Result of a `wait` call — a JobView plus a `timedOut` flag. */
+export interface WaitResult extends JobView {
+  timedOut: boolean;
 }
 
 /**
@@ -534,6 +570,189 @@ export class Fleet {
     return { ok: true, value: { jobs: summaries, nextCursor, size, unreadable } };
   }
 
+  /**
+   * Cancel a job. Transitions from `admitted`, `running`, or `waiting` to
+   * `cancelled`. Terminal states (`cancelled`, `archived`,
+   * `ready-for-acceptance`) refuse the transition as `policy-denied`.
+   */
+  async cancel(request: MutationRequest): Promise<Outcome<JobView>> {
+    return this.transitionToTerminal(
+      request,
+      "cancelled",
+      "cancel",
+      ["admitted", "running", "waiting"],
+    );
+  }
+
+  /**
+   * Archive a terminal job. Transitions from `cancelled` or
+   * `returned-to-orchestrator` to `archived`. The job's artifacts remain
+   * resolving; archiving is never destructive.
+   */
+  async archive(request: MutationRequest): Promise<Outcome<JobView>> {
+    return this.transitionToTerminal(
+      request,
+      "archived",
+      "archive",
+      ["cancelled", "returned-to-orchestrator"],
+    );
+  }
+
+  /**
+   * Clean a terminal job's scratch files. Removes the contents of `tmp/`
+   * and any worktree directories, but keeps every branch and the job
+   * record. The status is unchanged; the revision increments to record
+   * the mutation.
+   */
+  async clean(request: MutationRequest): Promise<Outcome<JobView>> {
+    if (this.store.readOnly) {
+      return { ok: false, problem: "policy-denied", message: "store is read-only (unknown schema major)" };
+    }
+    const jobIdResult = validateJobId(request.jobId);
+    if (!jobIdResult.ok) return jobIdResult;
+
+    const allowed: readonly JobStatus[] = ["cancelled", "returned-to-orchestrator"];
+    const result = await this.store.mutateJob(
+      request.jobId,
+      request.expectedRevision,
+      (current) => {
+        if (!allowed.includes(current.status)) {
+          return {
+            ok: false,
+            problem: "policy-denied",
+            message: `clean requires status in [${allowed.join(", ")}], got ${current.status}`,
+          };
+        }
+        return {
+          ok: true,
+          value: {
+            next: {
+              ...current,
+              revision: current.revision + 1,
+              updatedAt: new Date(this.clock()).toISOString(),
+            },
+            reason: "clean",
+          },
+        };
+      },
+    );
+    if (!result.ok) return result;
+
+    // Remove scratch files. Branches are preserved (no git operations yet).
+    await this.removeScratch(request.jobId);
+
+    return this.toJobView(result.value);
+  }
+
+  /**
+   * Wait for a job to reach a terminal state. Blocks up to `timeoutMs`
+   * (clamped to 60 seconds). Wakes on `ready-for-acceptance`,
+   * `returned-to-orchestrator`, or `cancelled`. Returns `timedOut: true`
+   * if the timeout expires first.
+   */
+  async wait(request: WaitRequest): Promise<Outcome<WaitResult>> {
+    const jobIdResult = validateJobId(request.jobId);
+    if (!jobIdResult.ok) return jobIdResult;
+
+    const timeoutMs = clampWaitTimeout(request.timeoutMs);
+    if (typeof timeoutMs !== "number") {
+      return { ok: false, problem: "invalid-input", message: timeoutMs };
+    }
+
+    // Verify the job exists before starting the poll.
+    const initial = await this.store.readJob(request.jobId);
+    if (!initial.ok) return initial;
+
+    const WAIT_TERMINAL_STATES: readonly JobStatus[] = [
+      "ready-for-acceptance",
+      "returned-to-orchestrator",
+      "cancelled",
+    ];
+
+    const deadline = Date.now() + timeoutMs;
+    const POLL_INTERVAL_MS = 100;
+
+    while (true) {
+      const current = await this.store.readJob(request.jobId);
+      if (!current.ok) return current;
+
+      if (WAIT_TERMINAL_STATES.includes(current.value.status)) {
+        const view = await this.toJobView(current.value);
+        if (!view.ok) return view;
+        return { ok: true, value: { ...view.value, timedOut: false } };
+      }
+
+      if (Date.now() >= deadline) {
+        const view = await this.toJobView(current.value);
+        if (!view.ok) return view;
+        return { ok: true, value: { ...view.value, timedOut: true } };
+      }
+
+      await sleep(Math.min(POLL_INTERVAL_MS, deadline - Date.now()));
+    }
+  }
+
+  /**
+   * Continue a job with explicit instructions. Transitions from `waiting`
+   * or `returned-to-orchestrator` to `running`. Never triggers a silent
+   * retry, weakens acceptance, or creates a third attempt.
+   */
+  async continue(request: ContinuationRequest): Promise<Outcome<Admission>> {
+    if (this.store.readOnly) {
+      return { ok: false, problem: "policy-denied", message: "store is read-only (unknown schema major)" };
+    }
+    const jobIdResult = validateJobId(request.jobId);
+    if (!jobIdResult.ok) return jobIdResult;
+
+    if (typeof request.instructions !== "string") {
+      return { ok: false, problem: "invalid-input", message: "instructions must be a string" };
+    }
+    if (request.instructions.trim().length === 0) {
+      return { ok: false, problem: "invalid-input", message: "instructions must be non-empty" };
+    }
+
+    const allowed: readonly JobStatus[] = ["waiting", "returned-to-orchestrator"];
+    const result = await this.store.mutateJob(
+      request.jobId,
+      request.expectedRevision,
+      (current) => {
+        if (!allowed.includes(current.status)) {
+          return {
+            ok: false,
+            problem: "policy-denied",
+            message: `continue requires status in [${allowed.join(", ")}], got ${current.status}`,
+          };
+        }
+        return {
+          ok: true,
+          value: {
+            next: {
+              ...current,
+              revision: current.revision + 1,
+              status: "running" as JobStatus,
+              updatedAt: new Date(this.clock()).toISOString(),
+            },
+            reason: "continue",
+          },
+        };
+      },
+    );
+    if (!result.ok) return result;
+
+    const size = await this.computeSize();
+    return {
+      ok: true,
+      value: {
+        jobId: result.value.jobId,
+        revision: result.value.revision,
+        status: result.value.status,
+        next: nextFor(result.value.status),
+        size,
+        admittedAt: result.value.updatedAt,
+      },
+    };
+  }
+
   /** Compute the soft size budget from the store. */
   async computeSize(): Promise<SizeBudget> {
     const bytes = await this.store.computeSizeBytes();
@@ -542,6 +761,106 @@ export class Fleet {
       softLimitBytes: this.store.config.softLimitBytes,
       overBudget: bytes > this.store.config.softLimitBytes,
     };
+  }
+
+  /**
+   * Shared transition logic for cancel and archive. Validates the job id,
+   * checks the current status is in the allowed set, and transitions to
+   * the target status.
+   */
+  private async transitionToTerminal(
+    request: MutationRequest,
+    targetStatus: JobStatus,
+    reason: string,
+    allowed: readonly JobStatus[],
+  ): Promise<Outcome<JobView>> {
+    if (this.store.readOnly) {
+      return { ok: false, problem: "policy-denied", message: "store is read-only (unknown schema major)" };
+    }
+    const jobIdResult = validateJobId(request.jobId);
+    if (!jobIdResult.ok) return jobIdResult;
+
+    const result = await this.store.mutateJob(
+      request.jobId,
+      request.expectedRevision,
+      (current) => {
+        if (!allowed.includes(current.status)) {
+          return {
+            ok: false,
+            problem: "policy-denied",
+            message: `${reason} requires status in [${allowed.join(", ")}], got ${current.status}`,
+          };
+        }
+        return {
+          ok: true,
+          value: {
+            next: {
+              ...current,
+              revision: current.revision + 1,
+              status: targetStatus,
+              updatedAt: new Date(this.clock()).toISOString(),
+            },
+            reason,
+          },
+        };
+      },
+    );
+    if (!result.ok) return result;
+    return this.toJobView(result.value);
+  }
+
+  /** Convert a job record to a JobView, reading the snapshot for the objective. */
+  private async toJobView(record: JobRecord): Promise<Outcome<JobView>> {
+    const snapshot = await this.store.readInputSnapshot(record.jobId);
+    if (!snapshot.ok) {
+      return {
+        ok: false,
+        problem: snapshot.problem,
+        message: `job ${record.jobId} has no readable input snapshot: ${snapshot.message}`,
+      };
+    }
+    const size = await this.computeSize();
+    const obj = (snapshot.value as Record<string, unknown>).objective;
+    const objective = typeof obj === "string" ? obj : "";
+    return {
+      ok: true,
+      value: {
+        jobId: record.jobId,
+        revision: record.revision,
+        status: record.status,
+        next: nextFor(record.status),
+        risk: record.risk,
+        repo: record.repo,
+        objective,
+        createdAt: record.createdAt,
+        updatedAt: record.updatedAt,
+        size,
+      },
+    };
+  }
+
+  /**
+   * Remove scratch files from a job's tmp/ directory. Preserves the
+   * directory itself so later operations can write to it. Also removes
+   * any worktree directories (none exist yet).
+   */
+  private async removeScratch(jobId: string): Promise<void> {
+    const tmpDir = Paths.tmpDir(this.store.root, jobId);
+    try {
+      const entries = await fs.readdir(tmpDir);
+      for (const entry of entries) {
+        await fs.rm(join(tmpDir, entry), { recursive: true, force: true });
+      }
+    } catch {
+      // tmp/ may not exist; that is fine.
+    }
+    // Worktrees directory is per-job but empty at this stage.
+    const wtDir = join(Paths.worktreesDir(this.store.root), jobId);
+    try {
+      await fs.rm(wtDir, { recursive: true, force: true });
+    } catch {
+      // No worktree; fine.
+    }
   }
 
   private async excerptFor(jobId: string): Promise<string> {
@@ -596,7 +915,39 @@ function decodeCursor(cursor: string | undefined): string | null | "invalid" {
 /** Re-export `Paths` so CLI callers can locate files for diagnostics. */
 export { Paths };
 
-/** Tiny sleep helper, used by the idempotency loser-waits loop. */
+/** Tiny sleep helper, used by the idempotency loser-waits loop and wait. */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Validate a job id. Returns `invalid-input` for empty, non-string, or
+ * non-ULID values.
+ */
+type JobIdOutcome = { ok: true } | { ok: false; problem: Problem; message: string };
+
+function validateJobId(value: unknown): JobIdOutcome {
+  if (typeof value !== "string" || value.length === 0) {
+    return { ok: false, problem: "invalid-input", message: "job id required" };
+  }
+  if (!isValidUlid(value)) {
+    return { ok: false, problem: "invalid-input", message: `invalid job id: ${value}` };
+  }
+  return { ok: true };
+}
+
+/** Maximum wait timeout: 60 seconds per the spec. */
+const MAX_WAIT_TIMEOUT_MS = 60_000;
+
+/**
+ * Clamp the wait timeout to [1, 60000] ms. Returns the clamped number on
+ * success, or an error message string on invalid input.
+ */
+function clampWaitTimeout(timeoutMs: number | undefined): number | string {
+  if (timeoutMs === undefined) return MAX_WAIT_TIMEOUT_MS;
+  if (typeof timeoutMs !== "number" || !Number.isFinite(timeoutMs)) {
+    return "timeoutMs must be a finite number";
+  }
+  if (timeoutMs <= 0) return "timeoutMs must be positive";
+  return Math.min(timeoutMs, MAX_WAIT_TIMEOUT_MS);
 }
