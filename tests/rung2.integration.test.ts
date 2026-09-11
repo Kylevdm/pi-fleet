@@ -467,3 +467,221 @@ describe("rung 2 — attempt 3 findings", () => {
     assert.ok(!topLevel.includes("tmp"), `root should not contain tmp/, found: ${topLevel.join(", ")}`);
   });
 });
+
+describe("rung 2 — state machine verbs", () => {
+  /** Helper to submit a job and return its id. */
+  async function submitJob(env: NodeJS.ProcessEnv, repo: string): Promise<string> {
+    const result = await new Promise<Run>((resolve, reject) => {
+      execFile(
+        binary,
+        ["submit", "--objective", "test job", "--repo", repo, "--risk", "low", "--json"],
+        { env },
+        (error, stdout, stderr) => {
+          if (error && typeof error.code === "string") { reject(error); return; }
+          const code = error && typeof error.code === "number" ? error.code : error ? null : 0;
+          const signal = error && "signal" in error ? (error.signal ?? null) : null;
+          resolve({ code, signal, stdout, stderr });
+        },
+      );
+    });
+    assert.strictEqual(result.code, 0, `submit failed: ${result.stdout}`);
+    return (JSON.parse(result.stdout) as Record<string, unknown>).jobId as string;
+  }
+
+  it("cancel transitions a job to cancelled via the CLI", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-r2-cancel-"));
+    const repo = mkdtempSync(join(tmpdir(), "fleet-r2-cancel-repo-"));
+    mkdirSync(join(repo, ".git"));
+    const env = { ...process.env, PI_FLEET_HOME: home };
+    const jobId = await submitJob(env, repo);
+
+    const result = await new Promise<Run>((resolve, reject) => {
+      execFile(
+        binary,
+        ["cancel", "--job-id", jobId, "--expected-revision", "1", "--json"],
+        { env },
+        (error, stdout, stderr) => {
+          if (error && typeof error.code === "string") { reject(error); return; }
+          const code = error && typeof error.code === "number" ? error.code : error ? null : 0;
+          const signal = error && "signal" in error ? (error.signal ?? null) : null;
+          resolve({ code, signal, stdout, stderr });
+        },
+      );
+    });
+    assert.strictEqual(result.code, 0, `cancel failed: ${result.stdout}`);
+    assert.strictEqual(result.stderr, "");
+    const envelope = JSON.parse(result.stdout) as Record<string, unknown>;
+    assert.strictEqual(envelope.ok, true);
+    assert.strictEqual(envelope.status, "cancelled");
+    assert.strictEqual(envelope.revision, 2);
+    assert.deepStrictEqual(envelope.next, ["get", "report", "clean", "archive"]);
+  });
+
+  it("cancel without --job-id is invalid-input", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-r2-cancel-noarg-"));
+    const env = { ...process.env, PI_FLEET_HOME: home };
+    const out = await expectEnvelope(["cancel", "--expected-revision", "1"], 1);
+    void env;
+    const envObj = out as Record<string, unknown>;
+    assert.strictEqual(envObj.ok, false);
+    assert.strictEqual(envObj.problem, "invalid-input");
+  });
+
+  it("archive transitions a cancelled job to archived via the CLI", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-r2-archive-"));
+    const repo = mkdtempSync(join(tmpdir(), "fleet-r2-archive-repo-"));
+    mkdirSync(join(repo, ".git"));
+    const env = { ...process.env, PI_FLEET_HOME: home };
+    const jobId = await submitJob(env, repo);
+
+    // Cancel first.
+    await new Promise<Run>((resolve, reject) => {
+      execFile(
+        binary,
+        ["cancel", "--job-id", jobId, "--expected-revision", "1", "--json"],
+        { env },
+        (error, stdout) => {
+          if (error && typeof error.code === "string") { reject(error); return; }
+          const code = error && typeof error.code === "number" ? error.code : error ? null : 0;
+          resolve({ code, signal: null, stdout, stderr: "" });
+        },
+      );
+    });
+
+    // Archive.
+    const result = await new Promise<Run>((resolve, reject) => {
+      execFile(
+        binary,
+        ["archive", "--job-id", jobId, "--expected-revision", "2", "--json"],
+        { env },
+        (error, stdout, stderr) => {
+          if (error && typeof error.code === "string") { reject(error); return; }
+          const code = error && typeof error.code === "number" ? error.code : error ? null : 0;
+          const signal = error && "signal" in error ? (error.signal ?? null) : null;
+          resolve({ code, signal, stdout, stderr });
+        },
+      );
+    });
+    assert.strictEqual(result.code, 0, `archive failed: ${result.stdout}`);
+    const envelope = JSON.parse(result.stdout) as Record<string, unknown>;
+    assert.strictEqual(envelope.ok, true);
+    assert.strictEqual(envelope.status, "archived");
+    assert.strictEqual(envelope.revision, 3);
+  });
+
+  it("clean removes scratch files via the CLI", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-r2-clean-"));
+    const repo = mkdtempSync(join(tmpdir(), "fleet-r2-clean-repo-"));
+    mkdirSync(join(repo, ".git"));
+    const env = { ...process.env, PI_FLEET_HOME: home };
+    const jobId = await submitJob(env, repo);
+
+    // Plant scratch files.
+    const tmpDir = Paths.tmpDir(home, jobId);
+    mkdirSync(tmpDir, { recursive: true });
+    writeFileSync(join(tmpDir, "scratch.json"), "{}");
+
+    // Cancel first.
+    await new Promise<Run>((resolve, reject) => {
+      execFile(
+        binary,
+        ["cancel", "--job-id", jobId, "--expected-revision", "1", "--json"],
+        { env },
+        (error, stdout) => {
+          if (error && typeof error.code === "string") { reject(error); return; }
+          const code = error && typeof error.code === "number" ? error.code : error ? null : 0;
+          resolve({ code, signal: null, stdout, stderr: "" });
+        },
+      );
+    });
+
+    // Clean.
+    const result = await new Promise<Run>((resolve, reject) => {
+      execFile(
+        binary,
+        ["clean", "--job-id", jobId, "--expected-revision", "2", "--json"],
+        { env },
+        (error, stdout, stderr) => {
+          if (error && typeof error.code === "string") { reject(error); return; }
+          const code = error && typeof error.code === "number" ? error.code : error ? null : 0;
+          const signal = error && "signal" in error ? (error.signal ?? null) : null;
+          resolve({ code, signal, stdout, stderr });
+        },
+      );
+    });
+    assert.strictEqual(result.code, 0, `clean failed: ${result.stdout}`);
+    const envelope = JSON.parse(result.stdout) as Record<string, unknown>;
+    assert.strictEqual(envelope.ok, true);
+    // Scratch is gone.
+    const entries = readdirSync(tmpDir);
+    assert.strictEqual(entries.length, 0, `tmp/ should be empty after clean`);
+  });
+
+  it("wait times out on an admitted job", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-r2-wait-"));
+    const repo = mkdtempSync(join(tmpdir(), "fleet-r2-wait-repo-"));
+    mkdirSync(join(repo, ".git"));
+    const env = { ...process.env, PI_FLEET_HOME: home };
+    const jobId = await submitJob(env, repo);
+
+    const result = await new Promise<Run>((resolve, reject) => {
+      execFile(
+        binary,
+        ["wait", "--job-id", jobId, "--timeout", "200", "--json"],
+        { env },
+        (error, stdout, stderr) => {
+          if (error && typeof error.code === "string") { reject(error); return; }
+          const code = error && typeof error.code === "number" ? error.code : error ? null : 0;
+          const signal = error && "signal" in error ? (error.signal ?? null) : null;
+          resolve({ code, signal, stdout, stderr });
+        },
+      );
+    });
+    assert.strictEqual(result.code, 0, `wait failed: ${result.stdout}`);
+    const envelope = JSON.parse(result.stdout) as Record<string, unknown>;
+    assert.strictEqual(envelope.ok, true);
+    assert.strictEqual(envelope.timedOut, true);
+  });
+
+  it("wait wakes immediately on a cancelled job", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-r2-wait-wake-"));
+    const repo = mkdtempSync(join(tmpdir(), "fleet-r2-wait-wake-repo-"));
+    mkdirSync(join(repo, ".git"));
+    const env = { ...process.env, PI_FLEET_HOME: home };
+    const jobId = await submitJob(env, repo);
+
+    // Cancel first.
+    await new Promise<Run>((resolve, reject) => {
+      execFile(
+        binary,
+        ["cancel", "--job-id", jobId, "--expected-revision", "1", "--json"],
+        { env },
+        (error, stdout) => {
+          if (error && typeof error.code === "string") { reject(error); return; }
+          const code = error && typeof error.code === "number" ? error.code : error ? null : 0;
+          resolve({ code, signal: null, stdout, stderr: "" });
+        },
+      );
+    });
+
+    // Wait should wake immediately.
+    const result = await new Promise<Run>((resolve, reject) => {
+      execFile(
+        binary,
+        ["wait", "--job-id", jobId, "--timeout", "5000", "--json"],
+        { env },
+        (error, stdout, stderr) => {
+          if (error && typeof error.code === "string") { reject(error); return; }
+          const code = error && typeof error.code === "number" ? error.code : error ? null : 0;
+          const signal = error && "signal" in error ? (error.signal ?? null) : null;
+          resolve({ code, signal, stdout, stderr });
+        },
+      );
+    });
+    assert.strictEqual(result.code, 0);
+    const envelope = JSON.parse(result.stdout) as Record<string, unknown>;
+    assert.strictEqual(envelope.ok, true);
+    assert.strictEqual(envelope.timedOut, false);
+    assert.strictEqual(envelope.status, "cancelled");
+  });
+});
