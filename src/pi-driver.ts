@@ -245,12 +245,15 @@ export function summarise(events: readonly PiEvent[]): StageSummary {
       case "tool_execution_end":
         if (typeof ev.toolName === "string" && ev.toolName.startsWith("submit_")) {
           summary.submitted = true;
-          // The spike drive.mjs treats the tool's result as the seal only
-          // when `terminate: true` was set on the tool and the call succeeded.
-          // We mirror that: a schema-valid result on a `submit_*` is the seal.
+          // A submit_* result only seals the stage when it (a) succeeded
+          // and (b) matches the submit_* payload schema. Anything else is
+          // prose masquerading as a result — the spec is explicit: prose
+          // never seals.
           if (ev.result?.details !== undefined && ev.result.isError !== true) {
-            summary.sealed = ev.result.details;
-            summary.sealedTool = ev.toolName;
+            if (validateSubmitPayload(ev.result.details).ok) {
+              summary.sealed = ev.result.details;
+              summary.sealedTool = ev.toolName;
+            }
           }
         }
         break;
@@ -373,6 +376,7 @@ const DEFAULT_SIGTERM_TO_SIGKILL_MS = 30_000;
  *   4. SIGKILL
  *
  * Returns which rung ended the process. The first rung that ends it wins.
+ * If the child has already exited before this function runs, returns `none`.
  *
  * @internal exported for testing.
  */
@@ -382,6 +386,15 @@ export async function terminate(
 ): Promise<TerminateRung> {
   const sigtermWaitMs = 10_000;
   const sigkillWaitMs = options.sigtermToSigkillMs ?? DEFAULT_SIGTERM_TO_SIGKILL_MS;
+
+  // Wait briefly to see whether the child exits on its own before we
+  // engage the ladder. A child that exits cleanly in the gap between
+  // spawn and the supervisor's cancel call should report `none`, not
+  // `abort` just because we wrote one line to a stdin it never read.
+  // The 50ms grace is small enough to be invisible to a real run but
+  // long enough to catch a synchronous `process.exit(0)`.
+  const exitedQuietly = await waitForExit(child, 50);
+  if (exitedQuietly) return "none";
 
   // Step 1: cooperative abort.
   try {

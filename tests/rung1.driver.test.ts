@@ -130,9 +130,11 @@ describe("driver (4) — LF-only framing", () => {
   });
 
   it("a CR alone (no LF) is part of the line — frames stay merged", () => {
-    const lines = parseJsonlLines('{"a":1\r\nstill part of line"}\n');
+    // CR alone is not a frame boundary; LF is. The CR sits inside the
+    // JSON string and stays there after framing.
+    const lines = parseJsonlLines('{"a":"x\ry"}\n');
     assert.strictEqual(lines.length, 1);
-    assert.strictEqual(lines[0], '{"a":1\r\nstill part of line"}');
+    assert.strictEqual(lines[0], '{"a":"x\ry"}');
   });
 
   it("every fixture line is parseable as a PiEvent", () => {
@@ -426,31 +428,33 @@ describe("driver (5) — launch timeout to first agent_start", () => {
     const sessionDir = join(stageDir, "session");
     const artifactPath = join(stageDir, "artifact.json");
 
-    // Spawn a stub that never emits agent_start: a `sleep` shell command
-    // would block on a subprocess; we use `node --eval` with a delay.
+    // Spawn a stub that never emits agent_start: a Node script that emits
+    // only `turn_start` and then waits. `piBinary` is therefore
+    // `process.execPath` and the script path is passed as argv[0]? No — the
+    // driver invokes `piBinary` with its own argv. We wrap the script as
+    // the `piBinary` itself by passing a node invocation via `cwd`: simpler
+    // is to make `piBinary` a one-liner script and rely on the kernel.
+    // mkstemp it and chmod +x.
     const sleeper = join(dir, "sleeper.mjs");
     writeFileSync(
       sleeper,
-      "setTimeout(() => process.exit(0), 60_000);\n" +
-      "process.stdout.write('{\"type\":\"turn_start\"}\\n');\n",
+      "#!/usr/bin/env node\n" +
+      "process.stdout.write('{\"type\":\"turn_start\"}\\n');\n" +
+      "setTimeout(() => process.exit(0), 60_000);\n",
     );
+    const { chmodSync } = await import("node:fs");
+    chmodSync(sleeper, 0o755);
 
-    const opts: RunStageOptions = {
+    const result = await runStage({
       jobId: "01JQQ000000000000000000000",
       stageIndex: 0,
       attempt: 1,
-      piBinary: process.execPath,
+      piBinary: sleeper,
       artifactPath,
       stageDir,
       sessionDir,
       launchTimeoutMs: 200,
       stageTimeoutMs: 60_000,
-    };
-    // We override piBinary to a script-like argv: use process.execPath on
-    // a small Node script that hangs.
-    const result = await runStage({
-      ...opts,
-      piBinary: sleeper,
     });
     assert.strictEqual(result.outcome.kind, "infra");
     if (result.outcome.kind === "infra") {
