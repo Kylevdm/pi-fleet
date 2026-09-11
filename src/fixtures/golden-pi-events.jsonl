@@ -1,0 +1,14 @@
+{"_fixture":"fleet-driver-golden/1","piVersion":"minimax-m3-fixture@1","capturedFrom":"spike 05"}
+{"type":"agent_start"}
+{"type":"turn_start"}
+{"type":"message_start","message":{"role":"assistant","api":"anthropic-messages","provider":"opencode-go","model":"minimax-m3","usage":{"input":1000,"output":20000,"cacheRead":0,"cacheWrite":0,"totalTokens":21000,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"pending","timestamp":1789039845782}}
+{"type":"message_update","usage":{"input":1000,"output":20000,"cacheRead":0,"cacheWrite":0,"totalTokens":21000,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"assistantMessageEvent":{"type":"thinking_start","contentIndex":0}}
+{"type":"message_update","usage":{"input":1000,"output":20000,"cacheRead":0,"cacheWrite":0,"totalTokens":21000,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"Plan: add a mul function, verify it, commit."}}
+{"type":"message_end","message":{"role":"assistant","usage":{"input":1000,"output":20000,"cacheRead":0,"cacheWrite":0,"totalTokens":21000,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"model":"minimax-m3","provider":"opencode-go","stopReason":"tool_use"}}
+{"type":"tool_execution_start","toolName":"bash"}
+{"type":"tool_execution_end","toolName":"bash","result":{"isError":false}}
+{"type":"message_start","message":{"role":"assistant","api":"anthropic-messages","provider":"opencode-go","model":"minimax-m3","usage":{"input":4970,"output":21503,"cacheRead":0,"cacheWrite":0,"totalTokens":26473,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"pending"}}
+{"type":"message_end","message":{"role":"assistant","usage":{"input":4970,"output":21503,"cacheRead":0,"cacheWrite":0,"totalTokens":26473,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"model":"minimax-m3","provider":"opencode-go","stopReason":"tool_use"}}
+{"type":"tool_execution_start","toolName":"submit_write"}
+{"type":"tool_execution_end","toolName":"submit_write","result":{"details":{"summary":"Added mul(a, b) to calc.js and exported it alongside add and sub.","filesTouched":["calc.js"],"commandsRun":["node -e \"console.log(require('./calc.js').mul(6,7))\""], "contractMet":true},"isError":false}}
+{"type":"agent_settled"}

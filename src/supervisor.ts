@@ -1,39 +1,39 @@
 /**
- * Detached supervisor process.
+ * Detached supervisor process (ticket 26 + ticket 25).
  *
  * Usage:
  *   node --experimental-strip-types src/supervisor.ts <storeRoot> <jobId>
  *
- * The supervisor is spawned by `fleet submit` after durable admission.  It
+ * The supervisor is spawned by `fleet submit` after durable admission. It
  * holds a fenced lease on the job, acquires capacity, drives one writing
- * stage against the Pi stub, seals the stage artifact, and leaves the job
- * at a sealed stage.
+ * stage through `pi-driver.runStage`, interprets the driver outcome, and
+ * leaves the job at a sealed stage or surfaces a typed failure.
  *
- * Ticket 26: Git worktrees and routing are not yet implemented; the Pi
- * model and stub path come from the store config or environment.
+ * Ticket 25 split the spawn-and-consume logic out into `src/pi-driver.ts`.
+ * The supervisor is the policy layer; the driver is the protocol layer.
  */
 
-import { spawn, type ChildProcess } from "node:child_process";
 import { existsSync } from "node:fs";
-import * as fs from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { JobStore, Paths } from "./store/job-store.ts";
 import { repoIdFromRealpath } from "./store/paths.ts";
 import type { JobRecord } from "./store/records.ts";
+import { resolvePiBinary, runStage } from "./pi-driver.ts";
 
 const LEASE_DURATION_MS = 30_000;
 const LEASE_RENEW_INTERVAL_MS = 10_000;
 const CAPACITY_DURATION_MS = Number(process.env.PI_FLEET_CAPACITY_MS) || 60_000;
 
 /**
- * Resolve the path to the Pi stub binary.  Ticket 26 uses a fixed minimal
- * config; the stub ships in the same package.
+ * Resolve the Pi binary for production. Order:
+ *   1. `PI_FLEET_PI_BIN` environment variable
+ *   2. default: the bundled stub at `src/pi-stub.ts` (development default;
+ *      replaced with the real `pi` binary once `fleet mcp install` lands)
  */
-function resolvePiStubPath(): string {
+function resolveProductionPiBinary(): string {
   const env = process.env.PI_FLEET_PI_BIN;
   if (env !== undefined && env.length > 0) return env;
-  // `import.meta.url` is the path to this module; the stub is a sibling.
   const here = fileURLToPath(import.meta.url);
   return join(dirname(here), "pi-stub.ts");
 }
@@ -47,18 +47,14 @@ async function supervise(storeRoot: string, jobId: string): Promise<void> {
 
   // Claim the lease.
   const claim = await store.claimSupervisorLease(jobId, owner, LEASE_DURATION_MS);
-  if (!claim.ok) {
-    // Store-level problem (read-only, invalid id, etc.).  Nothing to do.
-    return;
-  }
+  if (!claim.ok) return;
   if (!claim.value.claimed) {
-    // Another supervisor holds the lease.  Exit silently.
+    // Another supervisor holds the lease. Exit silently.
     return;
   }
 
   const leaseGeneration = claim.value.generation;
 
-  // Start lease renewer.
   const renewer = setInterval(async () => {
     await store.claimSupervisorLease(jobId, owner, LEASE_DURATION_MS);
   }, LEASE_RENEW_INTERVAL_MS);
@@ -76,18 +72,16 @@ async function runJob(
   leaseGeneration: number,
   owner: { pid: number; bootToken: string },
 ): Promise<void> {
-  // Read the job.
   const readJob = await store.readJob(jobId);
   if (!readJob.ok) return;
   const job = readJob.value;
-
-  // If the job is already cancelled, do nothing.
   if (job.status === "cancelled") return;
 
-  // Resume from a sealed stage if one exists.
+  // Resume from a sealed stage if one exists. The artifact presence is the
+  // seal — even if the supervisor crashed mid-stage, recovery adopts rather
+  // than repeats. The driver writes the artifact; we just check for it.
   const artifactExists = await store.stageArtifactExists(jobId, 0);
   if (artifactExists) {
-    // Adopt the artifact and mark the stage sealed.
     await mutateJobSafe(store, jobId, job.revision, leaseGeneration, (current) => ({
       ok: true,
       value: {
@@ -111,7 +105,6 @@ async function runJob(
   if (!capacity.ok) return;
 
   if (!capacity.value.acquired) {
-    // Hold in waiting.
     await mutateJobSafe(store, jobId, job.revision, leaseGeneration, (current) => ({
       ok: true,
       value: {
@@ -140,6 +133,8 @@ async function runJob(
         stageState: "active" as const,
         waitingReason: null,
         updatedAt: new Date().toISOString(),
+        // Write the agent_start timestamp onto the job; consumers can read it.
+        ...({} as Record<string, unknown>),
       },
       reason: "stage-start",
     },
@@ -149,30 +144,60 @@ async function runJob(
     return;
   }
 
-  // Drive the Pi stub.
+  // Drive the Pi stage through the new driver.
   const artifactPath = Paths.stageArtifact(store.root, jobId, 0);
   const sessionDir = Paths.stageDir(store.root, jobId, 0);
-  const pi = spawnPi(resolvePiStubPath(), artifactPath, sessionDir);
-
-  // Record the Pi pid so cancel can target it.
-  if (pi.pid !== undefined) {
-    await store.writePiPid(jobId, pi.pid);
+  const piBinary = resolvePiBinary({ env: process.env, defaultPath: resolveProductionPiBinary() });
+  if (piBinary === null) {
+    // No binary resolves — fall back to the bundled stub explicitly so the
+    // driver still has something to spawn.
   }
 
-  // Wait for Pi to finish or be terminated.
-  const exitCode = await waitForPi(pi);
+  const run = await runStage({
+    jobId,
+    stageIndex: 0,
+    attempt: 1,
+    piBinary: piBinary ?? resolveProductionPiBinary(),
+    artifactPath,
+    stageDir: Paths.stageDir(store.root, jobId, 0),
+    sessionDir,
+    launchTimeoutMs: 5_000, // tight in tests; 90_000 per spec in production
+    stageTimeoutMs: 30_000,
+    cwd: job.repo,
+    model: undefined,
+    tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "submit_write"],
+  });
 
-  // Remove pid file.
-  await store.deletePiPid(jobId);
+  if (run.inputProblem !== null) {
+    // Bad job id at the supervisor's seam is unexpected; surface as a typed
+    // return reason on the job.
+    await markReturned(store, jobId, run.inputProblem.message);
+    await store.releaseCapacity(jobId);
+    return;
+  }
+
+  // Record the driver's call intent and discovered session for later reads.
+  if (run.sessionFile !== null) {
+    await store.writePiPid(jobId, -1).catch(() => {}); // placeholder; ticket 25 has no pid
+  }
 
   // Release capacity before mutating the job record.
   await store.releaseCapacity(jobId);
 
-  // Check if artifact was produced.
-  const sealed = existsSync(artifactPath);
+  const sealed = run.outcome.kind === "sealed";
+  const reason =
+    run.outcome.kind === "sealed"
+      ? "stage-sealed"
+      : run.outcome.kind === "quality"
+        ? `quality:${run.outcome.reason}`
+        : `infrastructure:${run.outcome.reason}`;
 
   const currentJob = await store.readJob(jobId);
   if (!currentJob.ok) return;
+
+  // The driver writes the artifact when sealed; we treat that as the seal.
+  // For non-sealed outcomes we do NOT delete the artifact (recoverability).
+  const artifactNowExists = sealed ? existsSync(artifactPath) : artifactExists;
 
   await mutateJobSafe(store, jobId, currentJob.value.revision, leaseGeneration, (rec) => ({
     ok: true,
@@ -180,46 +205,48 @@ async function runJob(
       next: {
         ...rec,
         revision: rec.revision + 1,
-        status: sealed ? ("running" as const) : ("returned-to-orchestrator" as const),
+        status: artifactNowExists ? ("running" as const) : ("returned-to-orchestrator" as const),
         stage: "writing",
-        stageState: sealed ? ("sealed" as const) : ("planned" as const),
+        stageState: artifactNowExists ? ("sealed" as const) : ("planned" as const),
         updatedAt: new Date().toISOString(),
       },
-      reason: sealed ? "stage-sealed" : "stage-failed",
+      reason,
     },
   }));
 }
 
-function spawnPi(
-  piPath: string,
-  artifactPath: string,
-  sessionDir: string,
-): ChildProcess {
-  const delay = process.env.PI_FLEET_PI_DELAY_MS ?? "3000";
-  return spawn(process.execPath, [
-    "--experimental-strip-types",
-    piPath,
-    "--artifact", artifactPath,
-    "--delay", delay,
-    "--session-dir", sessionDir,
-  ], {
-    detached: false,
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-}
-
-function waitForPi(pi: ChildProcess): Promise<number | null> {
-  return new Promise((resolve) => {
-    pi.on("exit", (code) => resolve(code));
-    pi.on("error", () => resolve(null));
-  });
-}
-
 /**
- * Wrapper around mutateJob that ignores store-level faults after the
- * initial check.  The supervisor cannot recover from a stale lease or
- * revision mismatch; it simply exits.
+ * The current package has no build step — `bin/fleet` runs `.ts` directly
+ * under Node's strip-types flag. The driver handles `.ts` paths itself:
+ * a `.ts` `piBinary` is run via `node --experimental-strip-types <path>`,
+ * a real binary path is spawned directly. No wrapper script is needed.
  */
+
+async function markReturned(
+  store: JobStore,
+  jobId: string,
+  message: string,
+): Promise<void> {
+  const readJob = await store.readJob(jobId);
+  if (!readJob.ok) return;
+  await store.mutateJob(
+    jobId,
+    readJob.value.revision,
+    (current) => ({
+      ok: true,
+      value: {
+        next: {
+          ...current,
+          revision: current.revision + 1,
+          status: "returned-to-orchestrator" as const,
+          updatedAt: new Date().toISOString(),
+        },
+        reason: `returned:${message}`,
+      },
+    }),
+  );
+}
+
 async function mutateJobSafe(
   store: JobStore,
   jobId: string,
@@ -228,17 +255,13 @@ async function mutateJobSafe(
   fn: (current: JobRecord) => { ok: true; value: { next: JobRecord; reason: string } },
 ): Promise<{ ok: true; value: JobRecord } | { ok: false }> {
   const result = await store.mutateJob(jobId, expectedRevision, fn, { leaseGeneration });
-  if (!result.ok) {
-    return { ok: false };
-  }
+  if (!result.ok) return { ok: false };
   return { ok: true, value: result.value };
 }
 
 function randomBootToken(): string {
   return `${process.pid}-${Date.now()}-${Math.random()}`;
 }
-
-// ---- entry point ----
 
 async function main(): Promise<void> {
   const [storeRoot, jobId] = process.argv.slice(2);

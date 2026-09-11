@@ -768,8 +768,17 @@ export async function runStage(opts: RunStageOptions): Promise<RunResult> {
   };
   await atomicWriteJson(callIntentPath, callIntent);
 
-  // 2. Spawn.
+  // 2. Spawn. A `.ts` path is run under Node's strip-types flag (the
+  // package's default execution mode). A real binary path is spawned
+  // directly. The supervisor never sees this distinction.
+  const spawnArgv: string[] = [];
+  let spawnCommand = opts.piBinary;
+  if (opts.piBinary.endsWith(".ts")) {
+    spawnCommand = process.execPath;
+    spawnArgv.push("--experimental-strip-types", opts.piBinary);
+  }
   const argv: string[] = [
+    ...spawnArgv,
     "--mode", "rpc",
     "--session-dir", opts.sessionDir,
     "-n", session,
@@ -785,7 +794,7 @@ export async function runStage(opts: RunStageOptions): Promise<RunResult> {
   // here we pass it as argv instead so the stub binary can be kept simple.
   argv.push("--artifact", opts.artifactPath);
 
-  const child = spawn(opts.piBinary, argv, {
+  const child = spawn(spawnCommand, argv, {
     cwd: opts.cwd,
     stdio: ["pipe", "pipe", "pipe"],
   });
