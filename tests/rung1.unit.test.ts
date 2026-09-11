@@ -1971,3 +1971,232 @@ describe("ticket 23 third-review findings", () => {
     assert.ok(store instanceof JobStore);
   });
 });
+
+describe("ticket 26: supervisor lease", () => {
+  async function makeRepo(): Promise<string> {
+    const dir = mkdtempSync(join(tmpdir(), "fleet-repo-"));
+    mkdirSync(join(dir, ".git"));
+    return dir;
+  }
+
+  async function freshStore(): Promise<JobStore> {
+    return JobStore.open(mkdtempSync(join(tmpdir(), "fleet-store-")));
+  }
+
+  it("claimSupervisorLease claims a new lease with generation 1", async () => {
+    const store = await freshStore();
+    const result = await store.claimSupervisorLease("01JQQ000000000000000000000", { pid: 1, bootToken: "a" }, 30_000);
+    assert.strictEqual(result.ok, true);
+    if (!result.ok) return;
+    assert.strictEqual(result.value.claimed, true);
+    assert.strictEqual(result.value.generation, 1);
+  });
+
+  it("claimSupervisorLease rejects when the lease is still live", async () => {
+    const store = await freshStore();
+    const jobId = "01JQQ000000000000000000000";
+    const first = await store.claimSupervisorLease(jobId, { pid: 1, bootToken: "a" }, 30_000);
+    assert.ok(first.ok && first.value.claimed);
+    const second = await store.claimSupervisorLease(jobId, { pid: 2, bootToken: "b" }, 30_000);
+    assert.ok(second.ok);
+    if (!second.ok) return;
+    assert.strictEqual(second.value.claimed, false);
+    assert.strictEqual(second.value.generation, 1);
+  });
+
+  it("claimSupervisorLease succeeds after expiry plus grace", async () => {
+    const store = await freshStore();
+    const jobId = "01JQQ000000000000000000000";
+    const first = await store.claimSupervisorLease(jobId, { pid: 1, bootToken: "a" }, 10);
+    assert.ok(first.ok && first.value.claimed);
+    await new Promise((r) => setTimeout(r, 100)); // past 10ms + 30s grace? No, 10ms expiry, need 30s grace... too long.
+    // Use a backdated lease instead.
+    const leasePath = Paths.supervisorLease(store.root, jobId);
+    writeFileSync(leasePath, JSON.stringify({
+      schema: "supervisor-lease/1",
+      owner: { pid: 1, bootToken: "a" },
+      generation: 5,
+      claimedAt: new Date(Date.now() - 60_000).toISOString(),
+      expiresAt: new Date(Date.now() - 30_001).toISOString(), // past grace
+    }) + "\n");
+    const next = await store.claimSupervisorLease(jobId, { pid: 2, bootToken: "b" }, 30_000);
+    assert.ok(next.ok);
+    if (!next.ok) return;
+    assert.strictEqual(next.value.claimed, true);
+    assert.strictEqual(next.value.generation, 6);
+  });
+
+  it("breakSupervisorLease removes the lease", async () => {
+    const store = await freshStore();
+    const jobId = "01JQQ000000000000000000000";
+    await store.claimSupervisorLease(jobId, { pid: 1, bootToken: "a" }, 30_000);
+    const broke = await store.breakSupervisorLease(jobId);
+    assert.ok(broke.ok && broke.value);
+    const read = await store.readSupervisorLease(jobId);
+    assert.strictEqual(read.ok, false);
+    if (!read.ok) assert.strictEqual(read.problem, "not-found");
+  });
+});
+
+describe("ticket 26: capacity leases", () => {
+  async function freshStore(): Promise<JobStore> {
+    return JobStore.open(mkdtempSync(join(tmpdir(), "fleet-store-")));
+  }
+
+  it("acquireCapacity gets global and repo slots", async () => {
+    const store = await freshStore();
+    const result = await store.acquireCapacity("01JQQ000000000000000000000", "repo-a", { pid: 1, bootToken: "a" }, 30_000);
+    assert.ok(result.ok);
+    if (!result.ok) return;
+    assert.strictEqual(result.value.acquired, true);
+  });
+
+  it("acquireCapacity rejects when global limit (3) is reached", async () => {
+    const store = await freshStore();
+    const owner = { pid: 1, bootToken: "a" };
+    for (let i = 0; i < 3; i += 1) {
+      const jobId = `01JQQ00000000000000000000${i}`;
+      const r = await store.acquireCapacity(jobId, `repo-${i}`, owner, 30_000);
+      assert.ok(r.ok && r.value.acquired, `job ${i} should acquire`);
+    }
+    const fourth = await store.acquireCapacity("01JQQ000000000000000000009", "repo-x", owner, 30_000);
+    assert.ok(fourth.ok);
+    if (!fourth.ok) return;
+    assert.strictEqual(fourth.value.acquired, false);
+  });
+
+  it("acquireCapacity rejects when repo limit (1) is reached", async () => {
+    const store = await freshStore();
+    const owner = { pid: 1, bootToken: "a" };
+    const first = await store.acquireCapacity("01JQQ000000000000000000000", "repo-shared", owner, 30_000);
+    assert.ok(first.ok && first.value.acquired);
+    const second = await store.acquireCapacity("01JQQ000000000000000000001", "repo-shared", owner, 30_000);
+    assert.ok(second.ok);
+    if (!second.ok) return;
+    assert.strictEqual(second.value.acquired, false);
+  });
+
+  it("releaseCapacity frees both global and repo slots", async () => {
+    const store = await freshStore();
+    const jobId = "01JQQ000000000000000000000";
+    await store.acquireCapacity(jobId, "repo-a", { pid: 1, bootToken: "a" }, 30_000);
+    await store.releaseCapacity(jobId);
+    const after = await store.acquireCapacity(jobId, "repo-a", { pid: 1, bootToken: "a" }, 30_000);
+    assert.ok(after.ok && after.value.acquired);
+  });
+});
+
+describe("ticket 26: Fleet wait and cancel", () => {
+  async function makeRepo(): Promise<string> {
+    const dir = mkdtempSync(join(tmpdir(), "fleet-repo-"));
+    mkdirSync(join(dir, ".git"));
+    return dir;
+  }
+
+  async function freshStore(): Promise<JobStore> {
+    return JobStore.open(mkdtempSync(join(tmpdir(), "fleet-store-")));
+  }
+
+  function noopSpawner(): void {}
+
+  it("wait returns timedOut: true when the job never reaches a wake state", async () => {
+    const store = await freshStore();
+    const fleet = new Fleet(store, () => Date.now(), noopSpawner);
+    const repo = await makeRepo();
+    const submit = await fleet.submit({ objective: "wait me", repo, risk: "low" });
+    assert.ok(submit.ok);
+    const result = await fleet.wait({ jobId: (submit.value as { jobId: string }).jobId, timeoutMs: 100 });
+    assert.ok(result.ok);
+    if (!result.ok) return;
+    assert.strictEqual(result.value.timedOut, true);
+  });
+
+  it("wait returns immediately when the job is cancelled", async () => {
+    const store = await freshStore();
+    const fleet = new Fleet(store, () => Date.now(), noopSpawner);
+    const repo = await makeRepo();
+    const submit = await fleet.submit({ objective: "cancel me", repo, risk: "low" });
+    assert.ok(submit.ok);
+    const jobId = (submit.value as { jobId: string }).jobId;
+    const cancel = await fleet.cancel({ jobId, expectedRevision: 1 });
+    assert.ok(cancel.ok);
+    const result = await fleet.wait({ jobId, timeoutMs: 60_000 });
+    assert.ok(result.ok);
+    if (!result.ok) return;
+    assert.strictEqual(result.value.timedOut, false);
+    assert.strictEqual(result.value.status, "cancelled");
+  });
+
+  it("cancel returns stale-confirmation on a wrong revision", async () => {
+    const store = await freshStore();
+    const fleet = new Fleet(store, () => Date.now(), noopSpawner);
+    const repo = await makeRepo();
+    const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
+    assert.ok(submit.ok);
+    const jobId = (submit.value as { jobId: string }).jobId;
+    const result = await fleet.cancel({ jobId, expectedRevision: 99 });
+    assert.strictEqual(result.ok, false);
+    if (!result.ok) assert.strictEqual(result.problem, "stale-confirmation");
+  });
+
+  it("cancel breaks the lease, releases capacity, and preserves the record", async () => {
+    const store = await freshStore();
+    const fleet = new Fleet(store, () => Date.now(), noopSpawner);
+    const repo = await makeRepo();
+    const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
+    assert.ok(submit.ok);
+    const jobId = (submit.value as { jobId: string }).jobId;
+    // Pre-seed a lease and capacity.
+    await store.claimSupervisorLease(jobId, { pid: 999, bootToken: "x" }, 30_000);
+    await store.acquireCapacity(jobId, "repo-a", { pid: 999, bootToken: "x" }, 30_000);
+
+    const result = await fleet.cancel({ jobId, expectedRevision: 1 });
+    assert.ok(result.ok);
+    if (!result.ok) return;
+    assert.strictEqual(result.value.status, "cancelled");
+
+    const lease = await store.readSupervisorLease(jobId);
+    assert.strictEqual(lease.ok, false);
+
+    const cap = await store.acquireCapacity("01JQQ000000000000000000001", "repo-a", { pid: 1, bootToken: "a" }, 30_000);
+    assert.ok(cap.ok && cap.value.acquired, "capacity should be free after cancel");
+  });
+
+  it("mutateJob rejects a stale lease generation", async () => {
+    const store = await freshStore();
+    const fleet = new Fleet(store, () => Date.now(), noopSpawner);
+    const repo = await makeRepo();
+    const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
+    assert.ok(submit.ok);
+    const jobId = (submit.value as { jobId: string }).jobId;
+    await store.claimSupervisorLease(jobId, { pid: 1, bootToken: "a" }, 30_000);
+    const result = await store.mutateJob(jobId, 1, (current) => ({
+      ok: true,
+      value: { next: { ...current, revision: 2, updatedAt: "2026-01-02T00:00:00Z" }, reason: "test" },
+    }), { leaseGeneration: 99 });
+    assert.strictEqual(result.ok, false);
+    if (!result.ok) assert.strictEqual(result.problem, "conflict");
+  });
+});
+
+describe("ticket 26: stage artifacts", () => {
+  async function freshStore(): Promise<JobStore> {
+    return JobStore.open(mkdtempSync(join(tmpdir(), "fleet-store-")));
+  }
+
+  it("stageArtifactExists is false before writing", async () => {
+    const store = await freshStore();
+    const exists = await store.stageArtifactExists("01JQQ000000000000000000000", 0);
+    assert.strictEqual(exists, false);
+  });
+
+  it("writeStageArtifact creates a readable artifact", async () => {
+    const store = await freshStore();
+    const jobId = "01JQQ000000000000000000000";
+    const write = await store.writeStageArtifact(jobId, 0, { result: "ok" });
+    assert.ok(write.ok);
+    const read = await store.readStageArtifact(jobId, 0);
+    assert.ok(read.ok);
+    if (read.ok) assert.deepStrictEqual(read.value, { result: "ok" });
+  });
+});

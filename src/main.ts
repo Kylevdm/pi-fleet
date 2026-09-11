@@ -18,6 +18,8 @@ const KNOWN_FLAGS = [
   // Value-args for `list`.
   "--limit",
   "--cursor",
+  // Value-args for mutations.
+  "--expected-revision",
 ];
 
 /**
@@ -48,6 +50,21 @@ const VERB_TABLE: Record<string, VerbSpec> = {
     valueArgs: ["--limit", "--cursor"],
     boolFlags: ["--include-archived"],
   },
+  wait: {
+    verbs: ["wait"],
+    valueArgs: [],
+    boolFlags: [],
+  },
+  cancel: {
+    verbs: ["cancel"],
+    valueArgs: ["--expected-revision"],
+    boolFlags: [],
+  },
+  continue: {
+    verbs: ["continue"],
+    valueArgs: ["--expected-revision"],
+    boolFlags: [],
+  },
 };
 
 /** Parsed result: either an envelope to return or the typed inputs. */
@@ -67,6 +84,11 @@ interface ListArgs {
   limit: number | undefined;
   cursor: string | undefined;
   includeArchived: boolean;
+}
+
+interface MutationArgs {
+  jobId: string;
+  expectedRevision: number;
 }
 
 /** Boolean flags that do not consume the next token. */
@@ -185,6 +207,24 @@ export function run(argv: string[]): Envelope {
     const parsed = parseListArgsFromSplit(splitArgs(afterVerb));
     if (!parsed.ok) return parsed.envelope;
     return problemEnvelope("invalid-input", "list requires async; use bin/fleet");
+  }
+  if (verb === "wait") {
+    if (positionals.length < 2) {
+      return problemEnvelope("invalid-input", "fleet wait <jobId> requires a job id");
+    }
+    return problemEnvelope("invalid-input", "wait requires async; use bin/fleet");
+  }
+  if (verb === "cancel") {
+    if (positionals.length < 2) {
+      return problemEnvelope("invalid-input", "fleet cancel <jobId> requires a job id");
+    }
+    return problemEnvelope("invalid-input", "cancel requires async; use bin/fleet");
+  }
+  if (verb === "continue") {
+    if (positionals.length < 2) {
+      return problemEnvelope("invalid-input", "fleet continue <jobId> requires a job id");
+    }
+    return problemEnvelope("invalid-input", "continue requires async; use bin/fleet");
   }
   return problemEnvelope("invalid-input", `unknown verb: ${verb}`);
 }
@@ -321,6 +361,37 @@ function parseListArgsFromSplit(split: ReturnType<typeof splitArgs>): ParseResul
   };
 }
 
+function parseMutationArgsFromPositional(
+  positionals: string[],
+  args: readonly string[],
+  verb: string,
+): ParseResult<MutationArgs> {
+  if (positionals.length > 2) {
+    return {
+      ok: false,
+      envelope: problemEnvelope("invalid-input", `fleet ${verb} takes exactly one argument, got ${positionals.length - 1}`),
+    };
+  }
+  const jobId = positionals[1] as string;
+  if (!isValidUlid(jobId)) {
+    return { ok: false, envelope: problemEnvelope("invalid-input", `invalid job id: ${jobId}`) };
+  }
+  const afterVerb = stripVerb(args, verb);
+  const split = splitArgs(afterVerb);
+  if (split.error !== undefined) {
+    return { ok: false, envelope: problemEnvelope("invalid-input", split.error) };
+  }
+  const rawRev = split.valueMap["--expected-revision"];
+  if (rawRev === undefined) {
+    return { ok: false, envelope: problemEnvelope("invalid-input", "--expected-revision is required") };
+  }
+  if (!/^[1-9][0-9]*$/.test(rawRev)) {
+    return { ok: false, envelope: problemEnvelope("invalid-input", `--expected-revision must be a positive integer, got "${rawRev}"`) };
+  }
+  const expectedRevision = Number(rawRev);
+  return { ok: true, value: { jobId, expectedRevision } };
+}
+
 /** Convert an `Outcome<T>` to the flat envelope shape the CLI prints. */
 function outcomeToEnvelope<T extends object>(outcome: {
   ok: true; value: T;
@@ -429,6 +500,47 @@ export async function runAsync(argv: string[]): Promise<Envelope> {
       limit: parsed.value.limit,
       cursor: parsed.value.cursor,
       includeArchived: parsed.value.includeArchived,
+    });
+    return outcomeToEnvelope(outcome);
+  }
+  if (verb === "wait") {
+    if (positional.length < 2) {
+      return problemEnvelope("invalid-input", "fleet wait <jobId> requires a job id");
+    }
+    if (positional.length > 2) {
+      return problemEnvelope(
+        "invalid-input",
+        `fleet wait takes exactly one argument, got ${positional.length - 1}`,
+      );
+    }
+    const jobId = positional[1] as string;
+    if (!isValidUlid(jobId)) {
+      return problemEnvelope("invalid-input", `invalid job id: ${jobId}`);
+    }
+    const outcome = await fleet.wait({ jobId });
+    return outcomeToEnvelope(outcome);
+  }
+  if (verb === "cancel") {
+    if (positional.length < 2) {
+      return problemEnvelope("invalid-input", "fleet cancel <jobId> requires a job id");
+    }
+    const parsed = parseMutationArgsFromPositional(positional, args, verb);
+    if (!parsed.ok) return parsed.envelope;
+    const outcome = await fleet.cancel({
+      jobId: parsed.value.jobId,
+      expectedRevision: parsed.value.expectedRevision,
+    });
+    return outcomeToEnvelope(outcome);
+  }
+  if (verb === "continue") {
+    if (positional.length < 2) {
+      return problemEnvelope("invalid-input", "fleet continue <jobId> requires a job id");
+    }
+    const parsed = parseMutationArgsFromPositional(positional, args, verb);
+    if (!parsed.ok) return parsed.envelope;
+    const outcome = await fleet.continue({
+      jobId: parsed.value.jobId,
+      expectedRevision: parsed.value.expectedRevision,
     });
     return outcomeToEnvelope(outcome);
   }

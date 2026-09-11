@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { execFile } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { execFile, spawn } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -465,5 +465,250 @@ describe("rung 2 — attempt 3 findings", () => {
     assert.strictEqual(result.code, 0);
     const topLevel = readdirSync(home);
     assert.ok(!topLevel.includes("tmp"), `root should not contain tmp/, found: ${topLevel.join(", ")}`);
+  });
+});
+
+describe("ticket 26 rung 2 integration", () => {
+  async function submitJob(home: string, repo: string, envOverride?: Record<string, string>): Promise<{ jobId: string; revision: number }> {
+    const env = { ...process.env, PI_FLEET_HOME: home, ...envOverride };
+    const result = await new Promise<Run>((resolve, reject) => {
+      execFile(
+        binary,
+        ["submit", "--objective", "integration test", "--repo", repo, "--risk", "low", "--json"],
+        { env },
+        (error, stdout, stderr) => {
+          if (error && typeof error.code === "string") { reject(error); return; }
+          const code = error && typeof error.code === "number" ? error.code : error ? null : 0;
+          const signal = error && "signal" in error ? (error.signal ?? null) : null;
+          resolve({ code, signal, stdout, stderr });
+        },
+      );
+    });
+    assert.strictEqual(result.code, 0);
+    assert.strictEqual(result.stderr, "");
+    const envelope = JSON.parse(result.stdout) as Record<string, unknown>;
+    assert.strictEqual(envelope.ok, true);
+    return { jobId: envelope.jobId as string, revision: envelope.revision as number };
+  }
+
+  async function getJob(home: string, jobId: string): Promise<Record<string, unknown>> {
+    const env = { ...process.env, PI_FLEET_HOME: home };
+    const result = await new Promise<Run>((resolve, reject) => {
+      execFile(binary, ["get", jobId, "--json"], { env }, (error, stdout, stderr) => {
+        if (error && typeof error.code === "string") { reject(error); return; }
+        const code = error && typeof error.code === "number" ? error.code : error ? null : 0;
+        const signal = error && "signal" in error ? (error.signal ?? null) : null;
+        resolve({ code, signal, stdout, stderr });
+      });
+    });
+    assert.strictEqual(result.code, 0);
+    assert.strictEqual(result.stderr, "");
+    return JSON.parse(result.stdout) as Record<string, unknown>;
+  }
+
+  async function cancelJob(home: string, jobId: string, revision: number): Promise<Record<string, unknown>> {
+    const env = { ...process.env, PI_FLEET_HOME: home };
+    const result = await new Promise<Run>((resolve, reject) => {
+      execFile(
+        binary,
+        ["cancel", jobId, "--expected-revision", String(revision), "--json"],
+        { env },
+        (error, stdout, stderr) => {
+          if (error && typeof error.code === "string") { reject(error); return; }
+          const code = error && typeof error.code === "number" ? error.code : error ? null : 0;
+          const signal = error && "signal" in error ? (error.signal ?? null) : null;
+          resolve({ code, signal, stdout, stderr });
+        },
+      );
+    });
+    assert.strictEqual(result.stderr, "");
+    return JSON.parse(result.stdout) as Record<string, unknown>;
+  }
+
+  function runSupervisor(home: string, jobId: string): void {
+    const env = { ...process.env, PI_FLEET_HOME: home };
+    const supervisor = fileURLToPath(new URL("../src/supervisor.ts", import.meta.url));
+    spawn(process.execPath, ["--experimental-strip-types", supervisor, home, jobId], {
+      detached: true,
+      stdio: "ignore",
+      env,
+    });
+  }
+
+  async function readLease(home: string, jobId: string): Promise<{ owner: { pid: number } } | null> {
+    const path = Paths.supervisorLease(home, jobId);
+    if (!existsSync(path)) return null;
+    try {
+      return JSON.parse(readFileSync(path, "utf8")) as { owner: { pid: number } };
+    } catch {
+      return null;
+    }
+  }
+
+  async function pollFor(
+    predicate: () => Promise<boolean>,
+    timeoutMs: number,
+    intervalMs: number,
+  ): Promise<boolean> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      if (await predicate()) return true;
+      await new Promise((r) => setTimeout(r, intervalMs));
+    }
+    return false;
+  }
+
+  it("submit returns before the supervisor finishes (status is admitted immediately)", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-r26-submit-"));
+    const repo = mkdtempSync(join(tmpdir(), "fleet-r26-repo-"));
+    mkdirSync(join(repo, ".git"));
+    const { jobId } = await submitJob(home, repo);
+    const view = await getJob(home, jobId);
+    assert.strictEqual(view.status, "admitted");
+  });
+
+  it("SIGKILL of the supervisor mid-stage resumes from the last seal", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-r26-kill-"));
+    const repo = mkdtempSync(join(tmpdir(), "fleet-r26-repo-"));
+    mkdirSync(join(repo, ".git"));
+    const { jobId } = await submitJob(home, repo);
+
+    // Wait for the supervisor to claim the lease.
+    const hasLease = await pollFor(async () => (await readLease(home, jobId)) !== null, 5_000, 100);
+    assert.ok(hasLease, "supervisor should claim the lease");
+
+    // Wait for the stage to go active.
+    const isActive = await pollFor(async () => {
+      const j = await getJob(home, jobId);
+      return j.stageState === "active";
+    }, 5_000, 100);
+    assert.ok(isActive, "stage should go active");
+
+    // Kill the supervisor.
+    const lease = await readLease(home, jobId);
+    assert.ok(lease !== null);
+    try {
+      process.kill(lease!.owner.pid, "SIGKILL");
+    } catch {
+      // Already gone.
+    }
+
+    // Clean up the old lease and capacity so the new supervisor can proceed.
+    const store = await JobStore.open(home);
+    await store.breakSupervisorLease(jobId);
+    await store.releaseCapacity(jobId);
+
+    // Spawn a new supervisor.
+    runSupervisor(home, jobId);
+
+    // The new supervisor should resume and seal the stage.
+    const isSealed = await pollFor(async () => {
+      const j = await getJob(home, jobId);
+      return j.stageState === "sealed";
+    }, 10_000, 200);
+    assert.ok(isSealed, "new supervisor should seal the stage after resume");
+  });
+
+  it("a sealed stage is never re-run by a new supervisor", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-r26-norepeat-"));
+    const repo = mkdtempSync(join(tmpdir(), "fleet-r26-repo-"));
+    mkdirSync(join(repo, ".git"));
+    const { jobId } = await submitJob(home, repo);
+
+    // Let the first supervisor finish and seal the stage.
+    const isSealed = await pollFor(async () => {
+      const j = await getJob(home, jobId);
+      return j.stageState === "sealed";
+    }, 15_000, 200);
+    assert.ok(isSealed, "first supervisor should seal the stage");
+
+    // Record the artifact mtime.
+    const artifactPath = Paths.stageArtifact(home, jobId, 0);
+    assert.ok(existsSync(artifactPath), "artifact should exist");
+    const beforeMtime = statSync(artifactPath).mtimeMs;
+
+    // Manually revert the job record to active so a naive supervisor would re-run.
+    const store = await JobStore.open(home);
+    const job = await store.readJob(jobId);
+    assert.ok(job.ok);
+    await store.mutateJob(jobId, job.value.revision, (current) => ({
+      ok: true,
+      value: {
+        next: { ...current, revision: current.revision + 1, stageState: "active", updatedAt: new Date().toISOString() },
+        reason: "test-reset",
+      },
+    }));
+
+    // Break lease and spawn a new supervisor.
+    await store.breakSupervisorLease(jobId);
+    runSupervisor(home, jobId);
+
+    // Wait a bit for the new supervisor to do its work.
+    await new Promise((r) => setTimeout(r, 2_000));
+
+    // The artifact must not have been overwritten.
+    const afterMtime = statSync(artifactPath).mtimeMs;
+    assert.strictEqual(afterMtime, beforeMtime, "artifact must not be re-written");
+  });
+
+  it("single writer per repository via the per-repository capacity lease", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-r26-cap-"));
+    const repo = mkdtempSync(join(tmpdir(), "fleet-r26-repo-"));
+    mkdirSync(join(repo, ".git"));
+
+    // Submit first job with a very long Pi delay so it holds capacity.
+    const first = await submitJob(home, repo, { PI_FLEET_PI_DELAY_MS: "60000" });
+    const firstRunning = await pollFor(async () => {
+      const j = await getJob(home, first.jobId);
+      return j.status === "running";
+    }, 5_000, 200);
+    assert.ok(firstRunning, "first job should start running");
+
+    // Now submit the second job for the same repo.
+    const second = await submitJob(home, repo);
+
+    // The second job should end up waiting on capacity because the first
+    // holds the repo slot.
+    const secondWaiting = await pollFor(async () => {
+      const j = await getJob(home, second.jobId);
+      return j.status === "waiting" && j.waitingReason === "capacity";
+    }, 5_000, 200);
+    assert.ok(secondWaiting, "second job in same repo should wait on capacity");
+  });
+
+  it("cancel through the binary stops the job and preserves records", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-r26-cancel-"));
+    const repo = mkdtempSync(join(tmpdir(), "fleet-r26-repo-"));
+    mkdirSync(join(repo, ".git"));
+    const { jobId } = await submitJob(home, repo);
+
+    // Wait for the job to start running.
+    const isRunning = await pollFor(async () => {
+      const j = await getJob(home, jobId);
+      return j.status === "running";
+    }, 5_000, 200);
+    assert.ok(isRunning, "job should start running");
+
+    // Read the current revision — the supervisor may have bumped it.
+    let currentRevision = (await getJob(home, jobId)).revision as number;
+
+    let result = await cancelJob(home, jobId, currentRevision);
+
+    // If the supervisor moved the revision under us, fetch the latest and retry once.
+    if (result.ok === false && (result.problem === "stale-confirmation" || result.problem === "conflict")) {
+      currentRevision = (await getJob(home, jobId)).revision as number;
+      result = await cancelJob(home, jobId, currentRevision);
+    }
+
+    assert.strictEqual(result.ok, true, `cancel failed: ${JSON.stringify(result)}`);
+    assert.strictEqual(result.status, "cancelled");
+
+    // Capacity should be released: a new job in the same repo should run.
+    const next = await submitJob(home, repo);
+    const nextSealed = await pollFor(async () => {
+      const j = await getJob(home, next.jobId);
+      return j.stageState === "sealed";
+    }, 15_000, 200);
+    assert.ok(nextSealed, "capacity should be freed after cancel");
   });
 });

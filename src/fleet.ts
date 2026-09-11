@@ -1,9 +1,13 @@
 import type { Problem } from "./envelope.ts";
-import type { JobStatus, RiskClass } from "./store/records.ts";
+import type { JobStatus, RiskClass, StageState } from "./store/records.ts";
 import type { StoreOutcome } from "./store/job-store.ts";
 import { JobStore, hashIdempotencyKey, Paths } from "./store/job-store.ts";
 import { createUlidGenerator } from "./ulid.ts";
 import { resolveRepoRealpath } from "./store/paths.ts";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+import { existsSync } from "node:fs";
 
 /**
  * Outcome returned by every public Fleet method. Mirrors the `Outcome`
@@ -26,6 +30,9 @@ export interface JobView {
   jobId: string;
   revision: number;
   status: JobStatus;
+  stage: string | null;
+  stageState: StageState | null;
+  waitingReason: string | null;
   next: readonly string[];
   risk: RiskClass;
   repo: string;
@@ -72,6 +79,21 @@ export interface SubmitRequest {
   idempotencyKey?: string;
   overrides?: Record<string, unknown>;
 }
+
+export interface WaitRequest {
+  jobId: string;
+  timeoutMs?: number;
+}
+
+export interface MutationRequest {
+  jobId: string;
+  expectedRevision: number;
+}
+
+export type SupervisorSpawner = (storeRoot: string, jobId: string) => void;
+
+const MAX_WAIT_MS = 60_000;
+const WAIT_POLL_MS = 250;
 
 /**
  * Hard cap on the objective text. The brief says "bounded"; 4 KiB matches
@@ -225,14 +247,17 @@ export class Fleet {
   readonly store: JobStore;
   readonly clock: Clock;
   private readonly jobIdGenerator: () => string;
+  private readonly supervisorSpawner: SupervisorSpawner;
 
-  constructor(store: JobStore, clock: Clock = systemClock) {
+  constructor(
+    store: JobStore,
+    clock: Clock = systemClock,
+    supervisorSpawner?: SupervisorSpawner,
+  ) {
     this.store = store;
     this.clock = clock;
-    // Job ids come from a per-instance generator whose clock is the injected
-    // one, so an injected clock is honoured and scratch-file ULIDs elsewhere
-    // in the process cannot move this generator's monotonic state.
     this.jobIdGenerator = createUlidGenerator(() => this.clock());
+    this.supervisorSpawner = supervisorSpawner ?? defaultSupervisorSpawner;
   }
 
   /**
@@ -342,6 +367,9 @@ export class Fleet {
     );
     if (!jobOutcome.ok) return jobOutcome;
 
+    // Spawn the detached supervisor before returning.
+    this.supervisorSpawner(this.store.root, jobId);
+
     const size = await this.computeSize();
     return {
       ok: true,
@@ -421,10 +449,6 @@ export class Fleet {
     if (!job.ok) return job;
     const snapshot = await this.store.readInputSnapshot(jobId);
     if (!snapshot.ok) {
-      // Propagate the store's judgement. A hardcoded `conflict` described a
-      // corrupt snapshot as a revision disagreement; `not-found` and
-      // `unavailable-dependency` are the honest answers and the store knows
-      // which one applies.
       return {
         ok: false,
         problem: snapshot.problem,
@@ -440,6 +464,9 @@ export class Fleet {
         jobId: job.value.jobId,
         revision: job.value.revision,
         status: job.value.status,
+        stage: job.value.stage ?? null,
+        stageState: job.value.stageState ?? null,
+        waitingReason: job.value.waitingReason ?? null,
         next: nextFor(job.value.status),
         risk: job.value.risk,
         repo: job.value.repo,
@@ -449,6 +476,150 @@ export class Fleet {
         size,
       },
     };
+  }
+
+  /**
+   * Wait for a job to reach a terminal-ish state.  Blocks up to 60 seconds
+   * (clamped).  Returns immediately if the job is already in one of the
+   * wake states.  The envelope carries `timedOut: true` when the deadline
+   * expires without a wake state.
+   */
+  async wait(request: WaitRequest): Promise<Outcome<JobView & { timedOut?: boolean }>> {
+    const jobId = request.jobId;
+    if (typeof jobId !== "string" || jobId.length === 0) {
+      return { ok: false, problem: "invalid-input", message: "job id required" };
+    }
+    if (!isJobIdWellFormed(jobId)) {
+      return { ok: false, problem: "invalid-input", message: `invalid job id: ${jobId}` };
+    }
+
+    const timeoutMs = Math.min(request.timeoutMs ?? MAX_WAIT_MS, MAX_WAIT_MS);
+    const deadline = this.clock() + timeoutMs;
+    const wakeStates = new Set<JobStatus>([
+      "ready-for-acceptance",
+      "returned-to-orchestrator",
+      "cancelled",
+    ]);
+
+    while (this.clock() < deadline) {
+      const job = await this.store.readJob(jobId);
+      if (!job.ok) {
+        if (job.problem === "not-found") return job;
+        // On unreadable records, keep polling — the record may heal.
+      } else if (wakeStates.has(job.value.status)) {
+        const view = await this.get(jobId);
+        if (!view.ok) return view;
+        return { ok: true, value: { ...view.value, timedOut: false } };
+      }
+      const remaining = deadline - this.clock();
+      if (remaining <= 0) break;
+      await sleep(Math.min(WAIT_POLL_MS, remaining));
+    }
+
+    const view = await this.get(jobId);
+    if (!view.ok) return view;
+    return { ok: true, value: { ...view.value, timedOut: true } };
+  }
+
+  /**
+   * Cancel a job.  Breaks the supervisor lease, terminates the Pi process,
+   * releases capacity, and preserves every record.
+   */
+  async cancel(request: MutationRequest): Promise<Outcome<JobView>> {
+    if (typeof request.jobId !== "string" || request.jobId.length === 0) {
+      return { ok: false, problem: "invalid-input", message: "job id required" };
+    }
+    if (!isJobIdWellFormed(request.jobId)) {
+      return { ok: false, problem: "invalid-input", message: `invalid job id: ${request.jobId}` };
+    }
+
+    // Break the lease so the supervisor (if alive) knows it has lost ownership.
+    await this.store.breakSupervisorLease(request.jobId);
+
+    // Terminate the Pi process via the ladder.
+    const pidResult = await this.store.readPiPid(request.jobId);
+    if (pidResult.ok) {
+      await terminatePi(pidResult.value);
+    }
+    await this.store.deletePiPid(request.jobId);
+
+    // Release capacity.
+    await this.store.releaseCapacity(request.jobId);
+
+    // Seal any recoverable evidence: if a stage artifact exists, mark it.
+    const artifactExists = await this.store.stageArtifactExists(request.jobId, 0);
+
+    const mutate = await this.store.mutateJob(
+      request.jobId,
+      request.expectedRevision,
+      (current) => ({
+        ok: true,
+        value: {
+          next: {
+            ...current,
+            revision: current.revision + 1,
+            status: "cancelled" as const,
+            stage: current.stage ?? "writing",
+            stageState: artifactExists ? ("sealed" as const) : ("planned" as const),
+            updatedAt: new Date().toISOString(),
+          },
+          reason: "cancel",
+        },
+      }),
+    );
+    if (!mutate.ok) {
+      if (mutate.problem === "conflict") {
+        return {
+          ok: false,
+          problem: "stale-confirmation",
+          message: mutate.message,
+        };
+      }
+      return mutate;
+    }
+
+    return this.get(request.jobId);
+  }
+
+  /**
+   * Continue a returned or waiting job.  Stub for ticket 26 — a full
+   * implementation arrives with routing and multi-stage jobs.
+   */
+  async continue(request: MutationRequest): Promise<Outcome<JobView>> {
+    if (typeof request.jobId !== "string" || request.jobId.length === 0) {
+      return { ok: false, problem: "invalid-input", message: "job id required" };
+    }
+    if (!isJobIdWellFormed(request.jobId)) {
+      return { ok: false, problem: "invalid-input", message: `invalid job id: ${request.jobId}` };
+    }
+    const mutate = await this.store.mutateJob(
+      request.jobId,
+      request.expectedRevision,
+      (current) => ({
+        ok: true,
+        value: {
+          next: {
+            ...current,
+            revision: current.revision + 1,
+            updatedAt: new Date().toISOString(),
+          },
+          reason: "continue",
+        },
+      }),
+    );
+    if (!mutate.ok) {
+      if (mutate.problem === "conflict") {
+        return {
+          ok: false,
+          problem: "stale-confirmation",
+          message: mutate.message,
+        };
+      }
+      return mutate;
+    }
+    // For ticket 26, continue simply respawns the supervisor.
+    this.supervisorSpawner(this.store.root, request.jobId);
+    return this.get(request.jobId);
   }
 
   /**
@@ -596,7 +767,61 @@ function decodeCursor(cursor: string | undefined): string | null | "invalid" {
 /** Re-export `Paths` so CLI callers can locate files for diagnostics. */
 export { Paths };
 
-/** Tiny sleep helper, used by the idempotency loser-waits loop. */
+/** Tiny sleep helper, used by the idempotency loser-waits loop and wait. */
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function defaultSupervisorSpawner(storeRoot: string, jobId: string): void {
+  const here = fileURLToPath(import.meta.url);
+  const supervisorPath = join(dirname(here), "supervisor.ts");
+  const child = spawn(process.execPath, [
+    "--experimental-strip-types",
+    supervisorPath,
+    storeRoot,
+    jobId,
+  ], {
+    detached: true,
+    stdio: "ignore",
+  });
+  child.unref();
+}
+
+/**
+ * Termination ladder for the Pi process: SIGTERM, wait 10s, SIGKILL.
+ * Returns once the process has exited or the ladder is complete.
+ */
+async function terminatePi(pid: number): Promise<void> {
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    // Already gone.
+    return;
+  }
+  const exited = await waitForExit(pid, 10_000);
+  if (exited) return;
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // Already gone.
+  }
+}
+
+function waitForExit(pid: number, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const start = Date.now();
+    const timer = setInterval(() => {
+      try {
+        process.kill(pid, 0);
+      } catch {
+        clearInterval(timer);
+        resolve(true);
+        return;
+      }
+      if (Date.now() - start >= timeoutMs) {
+        clearInterval(timer);
+        resolve(false);
+      }
+    }, 100);
+  });
 }
