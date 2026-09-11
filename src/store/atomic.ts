@@ -287,6 +287,30 @@ function isErrno(error: unknown, code: string): boolean {
  *
  * Idempotent: a missing lock is a no-op, not an error.
  */
+/**
+ * True when the lock file at `target` still records this process as its holder.
+ *
+ * The lock's mtime is set at acquisition and never refreshed, so a mutation
+ * that outlives `staleMs` can have its lock broken and re-acquired underneath
+ * it. Checking ownership immediately before the commit closes the window in
+ * which both writers read revision N and both write N+1, losing one of them.
+ * A renewal protocol belongs with the supervisor leases, not here.
+ */
+export async function holdsLock(target: string): Promise<boolean> {
+  let content: string;
+  try {
+    content = await fs.readFile(target, "utf8");
+  } catch {
+    return false;
+  }
+  try {
+    const holder = JSON.parse(content) as { pid?: unknown; bootToken?: unknown };
+    return holder.pid === process.pid && holder.bootToken === BOOT_TOKEN;
+  } catch {
+    return false;
+  }
+}
+
 export async function releaseLock(
   target: string,
   options: { audit?: string } = {},

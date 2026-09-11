@@ -164,7 +164,7 @@ export function run(argv: string[]): Envelope {
   // `runAsync`. The synchronous `run` here still validates the verb shape.
   if (verb === "submit") {
     // Re-parse only the args after the verb, excluding --json.
-    const afterVerb = args.slice(args.indexOf(verb) + 1);
+    const afterVerb = stripVerb(args, verb);
     const parsed = parseSubmitArgsFromSplit(splitArgs(afterVerb));
     if (!parsed.ok) return parsed.envelope;
     // Sync surface returns invalid-input directing the caller to await.
@@ -181,7 +181,7 @@ export function run(argv: string[]): Envelope {
     return problemEnvelope("invalid-input", "get requires async; use bin/fleet");
   }
   if (verb === "list") {
-    const afterVerb = args.slice(args.indexOf(verb) + 1);
+    const afterVerb = stripVerb(args, verb);
     const parsed = parseListArgsFromSplit(splitArgs(afterVerb));
     if (!parsed.ok) return parsed.envelope;
     return problemEnvelope("invalid-input", "list requires async; use bin/fleet");
@@ -201,6 +201,41 @@ function lookupVerb(name: string): { name: string; spec: VerbSpec } | undefined 
  * `--json` is always allowed (it is a global flag). Returns an error message
  * or `undefined` if all flags are valid.
  */
+/**
+ * Everything except the verb, with flags left wherever the caller put them.
+ *
+ * Slicing from `indexOf(verb)` dropped any value flag that appeared before the
+ * verb, so `fleet --risk low submit ...` reported "--risk is required" while
+ * `--json` before the verb worked — an unstated position rule whose diagnostic
+ * actively misled. It also matched the verb string inside a flag's value. This
+ * walks the tokens the way `splitArgs` does and removes only the first
+ * positional that is the verb.
+ */
+function stripVerb(args: readonly string[], verb: string): string[] {
+  const kept: string[] = [];
+  let removed = false;
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i] as string;
+    if (!a.startsWith("--")) {
+      if (!removed && a === verb) {
+        removed = true;
+        continue;
+      }
+      kept.push(a);
+      continue;
+    }
+    kept.push(a);
+    const eq = a.indexOf("=");
+    if (eq > 0 || BOOL_FLAGS.has(a)) continue;
+    const next = args[i + 1];
+    if (next !== undefined) {
+      kept.push(next);
+      i += 1;
+    }
+  }
+  return kept;
+}
+
 function validateVerbFlags(spec: VerbSpec, seenFlags: ReadonlySet<string>): string | undefined {
   const allowed = new Set<string>([...spec.valueArgs, ...spec.boolFlags, "--json"]);
   for (const flag of seenFlags) {
@@ -345,13 +380,19 @@ export async function runAsync(argv: string[]): Promise<Envelope> {
   try {
     store = await JobStore.open(resolveStoreRoot());
   } catch (error) {
-    return problemEnvelope("policy-denied", `store unavailable: ${(error as Error).message}`);
+    // `unavailable-dependency`, not `policy-denied`: EACCES on the root, EROFS,
+    // ENOSPC and an unparseable config are all broken-store conditions. Saying
+    // "policy denied" tells an operator their request was refused on purpose.
+    return problemEnvelope(
+      "unavailable-dependency",
+      `store unavailable: ${(error as Error).message}`,
+    );
   }
   const fleet = new Fleet(store);
 
   if (verb === "submit") {
     // Strip the verb and parse the remaining args.
-    const afterVerb = args.slice(args.indexOf(verb) + 1);
+    const afterVerb = stripVerb(args, verb);
     const parsed = parseSubmitArgsFromSplit(splitArgs(afterVerb));
     if (!parsed.ok) return parsed.envelope;
     const outcome = await fleet.submit({
@@ -381,7 +422,7 @@ export async function runAsync(argv: string[]): Promise<Envelope> {
     return outcomeToEnvelope(outcome);
   }
   if (verb === "list") {
-    const afterVerb = args.slice(args.indexOf(verb) + 1);
+    const afterVerb = stripVerb(args, verb);
     const parsed = parseListArgsFromSplit(splitArgs(afterVerb));
     if (!parsed.ok) return parsed.envelope;
     const outcome = await fleet.list({

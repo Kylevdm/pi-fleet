@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFile } from "node:child_process";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -276,5 +276,36 @@ describe("ticket 23 close-out: CLI argument handling", () => {
     }
     const good = await runBinary(["list", "--limit", "5", "--json"], env);
     assert.strictEqual((JSON.parse(good.stdout.trimEnd()) as Record<string, unknown>).ok, true);
+  });
+});
+
+/**
+ * CLI-level outcomes from the third review: a broken store is a dependency
+ * failure, and a value flag is honoured wherever it appears.
+ */
+describe("ticket 23 third-review: CLI outcomes", () => {
+  it("F6: an unparseable config reports unavailable-dependency, not policy-denied", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-r3-cfg-"));
+    mkdirSync(home, { recursive: true });
+    writeFileSync(join(home, "config.json"), "oops");
+    const run = await runBinary(["list", "--json"], { ...process.env, PI_FLEET_HOME: home });
+    const envelope = JSON.parse(run.stdout.trimEnd()) as Record<string, unknown>;
+    assert.strictEqual(envelope.ok, false);
+    assert.strictEqual(envelope.problem, "unavailable-dependency");
+    assert.strictEqual(run.code, 1);
+  });
+
+  it("F7: a value flag before the verb is honoured, not silently dropped", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-r3-pre-"));
+    const repo = mkdtempSync(join(tmpdir(), "fleet-r3-pre-repo-"));
+    mkdirSync(join(repo, ".git"));
+    const env = { ...process.env, PI_FLEET_HOME: home };
+    const run = await runBinary(
+      ["--risk", "low", "submit", "--objective", "flags before the verb", "--repo", repo, "--json"],
+      env,
+    );
+    const envelope = JSON.parse(run.stdout.trimEnd()) as Record<string, unknown>;
+    assert.strictEqual(envelope.ok, true, run.stdout);
+    assert.strictEqual(run.code, 0);
   });
 });

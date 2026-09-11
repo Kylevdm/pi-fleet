@@ -86,6 +86,13 @@ const OBJECTIVE_MAX_BYTES = 4096;
 const OBJECTIVE_EXCERPT_LEN = 120;
 
 /**
+ * How long `submit` waits for a concurrent winner's job to become readable
+ * before returning `conflict`: 40 attempts at 25ms, so about one second.
+ */
+const SETTLE_ATTEMPTS = 40;
+const SETTLE_SLEEP_MS = 25;
+
+/**
  * Default page size for `list`. The spec says "bounded default and maximum
  * page size"; 50 and 200 are the typical pagination defaults.
  */
@@ -362,7 +369,11 @@ export class Fleet {
     | { kind: "reclaimed" }
     | { kind: "problem"; problem: Problem; message: string }
   > {
-    for (;;) {
+    // Bounded. An unbounded `for(;;)` with a 10ms sleep turned a crashed
+    // winner into a CLI invocation that silently spun for the full reclaim
+    // window (60s) at ~100 filesystem round-trips a second. A caller is better
+    // served by `conflict` and its own retry than by a command that hangs.
+    for (let attempt = 0; attempt < SETTLE_ATTEMPTS; attempt += 1) {
       const current = await this.store.readIdempotencyRecord(hash);
       if (!current.ok) {
         if (current.problem === "not-found") return { kind: "reclaimed" };
@@ -388,8 +399,14 @@ export class Fleet {
         return { kind: "problem", problem: reclaim.problem, message: reclaim.message };
       }
       if (reclaim.value.reclaimed) return { kind: "reclaimed" };
-      await sleep(10);
+      await sleep(SETTLE_SLEEP_MS);
     }
+    return {
+      kind: "problem",
+      problem: "conflict",
+      message:
+        "another submit holds this idempotency key and its job is not yet readable; retry",
+    };
   }
 
   /** Read a job by id. Returns `not-found` for unknown ids. */
@@ -404,10 +421,14 @@ export class Fleet {
     if (!job.ok) return job;
     const snapshot = await this.store.readInputSnapshot(jobId);
     if (!snapshot.ok) {
+      // Propagate the store's judgement. A hardcoded `conflict` described a
+      // corrupt snapshot as a revision disagreement; `not-found` and
+      // `unavailable-dependency` are the honest answers and the store knows
+      // which one applies.
       return {
         ok: false,
-        problem: "conflict",
-        message: `job ${jobId} is missing its input snapshot`,
+        problem: snapshot.problem,
+        message: `job ${jobId} has no readable input snapshot: ${snapshot.message}`,
       };
     }
     const size = await this.computeSize();
@@ -480,7 +501,11 @@ export class Fleet {
         // An unreadable record is skipped so one corrupt file cannot take out
         // the whole list. The count is reported so the caller is told rather
         // than quietly handed a short page.
-        if (job.problem === "unavailable-dependency") unreadable += 1;
+        // `not-found` counts too: a submit that died between `mkdir` and the
+        // exclusive `job.json` commit leaves a directory whose id is listed but
+        // has no record. Counting only corruption handed the caller a short
+        // page and told it nothing — the thing this field exists to prevent.
+        unreadable += 1;
         continue;
       }
       if (!query.includeArchived && job.value.status === "archived") continue;

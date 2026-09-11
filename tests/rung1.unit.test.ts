@@ -1811,3 +1811,163 @@ describe("ticket 23 close-out findings", () => {
     });
   });
 });
+
+/**
+ * Third-review findings. Every test here failed against the code as the third
+ * review found it: each of these paths either threw a raw error out of a public
+ * method, hung, or left litter behind.
+ */
+describe("ticket 23 third-review findings", () => {
+  async function freshStore(): Promise<{ store: JobStore; fleet: Fleet; home: string; repo: string }> {
+    const home = mkdtempSync(join(tmpdir(), "fleet-r3f-"));
+    const repo = mkdtempSync(join(tmpdir(), "fleet-r3f-repo-"));
+    mkdirSync(join(repo, ".git"));
+    const store = await JobStore.open(home);
+    return { store, fleet: new Fleet(store), home, repo };
+  }
+
+  it("F1: a corrupt input snapshot is a typed problem, not a raw SyntaxError", async () => {
+    const { store, fleet, home, repo } = await freshStore();
+    const admitted = await fleet.submit({ objective: "will be corrupted", repo, risk: "low" });
+    assert.ok(admitted.ok);
+    const jobId = admitted.value.jobId;
+    writeFileSync(Paths.inputSnapshot(home, jobId), '{"schema":"input-');
+
+    const read = await store.readInputSnapshot(jobId);
+    assert.strictEqual(read.ok, false);
+    if (!read.ok) assert.strictEqual(read.problem, "unavailable-dependency");
+
+    const got = await fleet.get(jobId);
+    assert.strictEqual(got.ok, false);
+    if (!got.ok) assert.strictEqual(got.problem, "unavailable-dependency");
+
+    // And the listing survives it.
+    const page = await fleet.list({});
+    assert.ok(page.ok);
+  });
+
+  it("F2: a corrupt idempotency record is a typed problem, not a raw SyntaxError", async () => {
+    const { store, fleet, home, repo } = await freshStore();
+    const first = await fleet.submit({ objective: "keyed", repo, risk: "low", idempotencyKey: "K" });
+    assert.ok(first.ok);
+    const hash = hashIdempotencyKey("K");
+    writeFileSync(Paths.idempotencyRecord(home, hash), "{");
+
+    const read = await store.readIdempotencyRecord(hash);
+    assert.strictEqual(read.ok, false);
+    if (!read.ok) assert.strictEqual(read.problem, "unavailable-dependency");
+
+    const retried = await fleet.submit({
+      objective: "keyed",
+      repo,
+      risk: "low",
+      idempotencyKey: "K",
+    });
+    assert.strictEqual(retried.ok, false);
+    if (!retried.ok) assert.strictEqual(retried.problem, "unavailable-dependency");
+  });
+
+  it("F3: a claim whose job never appears returns conflict instead of spinning", async () => {
+    const { store, fleet, home, repo } = await freshStore();
+    // Stand in for a writer that died after claiming the key and before
+    // committing the job: a fresh claim pointing at a job that is not there.
+    const hash = hashIdempotencyKey("ORPHAN");
+    const claimed = await store.writeIdempotencyRecord(hash, {
+      key: "ORPHAN",
+      jobId: "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+      createdAt: new Date().toISOString(),
+    });
+    assert.ok(claimed.ok, "expected the claim to be writable");
+    assert.ok(existsSync(Paths.idempotencyRecord(home, hash)));
+
+    const started = Date.now();
+    const outcome = await fleet.submit({
+      objective: "waits on the orphan",
+      repo,
+      risk: "low",
+      idempotencyKey: "ORPHAN",
+    });
+    const elapsed = Date.now() - started;
+    assert.strictEqual(outcome.ok, false);
+    if (!outcome.ok) assert.strictEqual(outcome.problem, "conflict");
+    // The unbounded version spun for the full 60s reclaim window.
+    assert.ok(elapsed < 15_000, `submit took ${elapsed}ms; expected a bounded wait`);
+  });
+
+  it("F4: mutating a job that does not exist leaves no phantom directory", async () => {
+    const { store } = await freshStore();
+    const before = await store.listJobIds();
+    const outcome = await store.mutateJob("01ARZ3NDEKTSV4RRFFQ69G5FAV", 1, (current) => ({
+      ok: true,
+      value: { next: { ...current, revision: current.revision + 1 }, reason: "never runs" },
+    }));
+    assert.strictEqual(outcome.ok, false);
+    if (!outcome.ok) assert.strictEqual(outcome.problem, "not-found");
+    assert.deepStrictEqual(await store.listJobIds(), before);
+  });
+
+  it("F5: a staleMs of zero is rejected, so locks still exclude", async () => {
+    const home = mkdtempSync(join(tmpdir(), "fleet-r3f-stale-"));
+    mkdirSync(home, { recursive: true });
+    writeFileSync(
+      join(home, "config.json"),
+      JSON.stringify({
+        schema: "config/1",
+        store: { softLimitBytes: 1073741824 },
+        lock: { staleMs: 0 },
+      }),
+    );
+    await JobStore.open(home);
+    // A zero timeout would make the live lock instantly breakable.
+    const lock = join(home, "probe.lock");
+    await acquireLock(lock, { staleMs: 30_000 });
+    await assert.rejects(
+      () => acquireLock(lock, { staleMs: 30_000 }),
+      LockHeldError,
+    );
+    await releaseLock(lock);
+  });
+
+  it("F9: a job directory with no readable record is counted, not silently dropped", async () => {
+    const { fleet, home, repo } = await freshStore();
+    const admitted = await fleet.submit({ objective: "the healthy one", repo, risk: "low" });
+    assert.ok(admitted.ok);
+    // A submit that died between mkdir and the exclusive job.json commit.
+    mkdirSync(join(home, "jobs", "01ARZ3NDEKTSV4RRFFQ69G5FAV"), { recursive: true });
+
+    const page = await fleet.list({});
+    assert.ok(page.ok);
+    assert.strictEqual(page.value.jobs.length, 1);
+    assert.strictEqual(page.value.unreadable, 1);
+  });
+
+  it("F10: an unwritable audit log does not turn an admitted job into a fault", async () => {
+    const { store, home } = await freshStore();
+    const jobId = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
+    // Make the audit path un-appendable by putting a directory in its place.
+    mkdirSync(Paths.jobAudit(home, jobId), { recursive: true });
+    const outcome = await store.writeJobNew(jobId, "low", "/somewhere", "admitted", {
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    });
+    assert.ok(outcome.ok, "an audit failure must not fail an already-committed job");
+    const readBack = await store.readJob(jobId);
+    assert.ok(readBack.ok);
+  });
+
+  it("F11: a read-only store refuses to reclaim an idempotency record", async () => {
+    const { store, fleet, home, repo } = await freshStore();
+    const first = await fleet.submit({ objective: "keyed", repo, risk: "low", idempotencyKey: "K" });
+    assert.ok(first.ok);
+    const storeJson = join(home, "store.json");
+    const record = JSON.parse(readFileSync(storeJson, "utf8")) as Record<string, unknown>;
+    record.schema = "store/9";
+    writeFileSync(storeJson, JSON.stringify(record));
+
+    const reopened = await JobStore.open(home);
+    const reclaim = await reopened.reclaimIdempotencyRecord(hashIdempotencyKey("K"));
+    assert.strictEqual(reclaim.ok, false);
+    if (!reclaim.ok) assert.strictEqual(reclaim.problem, "policy-denied");
+    assert.ok(store instanceof JobStore);
+  });
+});

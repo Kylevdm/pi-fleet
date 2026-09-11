@@ -13,6 +13,7 @@ import {
   writeFileExclusive,
   FileExistsError,
   LockHeldError,
+  holdsLock,
 } from "./atomic.ts";
 import { storePath, ensureWithinRoot } from "./paths.ts";
 import { isValidUlid } from "../ulid.ts";
@@ -106,6 +107,11 @@ const DEFAULT_STALE_MS = 30_000;
  * under its owner.
  */
 const IDEMPOTENCY_RECLAIM_MS = 60_000;
+
+/** True when `error` is a Node errno error carrying exactly `code`. */
+function isErrnoCode(error: unknown, code: string): boolean {
+  return error instanceof Error && "code" in error && error.code === code;
+}
 
 export class JobStore {
   readonly root: string;
@@ -220,7 +226,9 @@ export class JobStore {
         return { ok: false, problem: "invalid-input", message: "config.lock must be an object" };
       }
       const v = (lockObj as Record<string, unknown>).staleMs;
-      if (typeof v === "number" && Number.isFinite(v) && v >= 0) staleMs = v;
+      // Strictly positive: `staleMs: 0` makes every lock instantly stale, so
+      // every acquire breaks the live holder's lock and mutual exclusion is gone.
+      if (typeof v === "number" && Number.isFinite(v) && v > 0) staleMs = v;
     }
     return { ok: true, value: { softLimitBytes: soft, staleMs } };
   }
@@ -354,13 +362,16 @@ export class JobStore {
       }
       throw error;
     }
+    // The job is committed. An audit append that fails now must not turn an
+    // admitted job into a fault envelope: the caller would never learn the
+    // jobId of a job that is on disk and will appear in `list` forever.
     await appendJsonLine(Paths.jobAudit(this.root, jobId), {
       schema: "audit/1",
       timestamp: timestamps.createdAt,
       action: "submit",
       revision: 1,
       reason: "admission",
-    });
+    }).catch(() => {});
     return { ok: true, value: record };
   }
 
@@ -423,7 +434,26 @@ export class JobStore {
     if (!existsSync(target)) {
       return { ok: false, problem: "not-found", message: `no snapshot: ${jobId}` };
     }
-    const raw = await readJsonFile(target);
+    let raw: unknown;
+    try {
+      raw = await readJsonFile(target);
+    } catch (error) {
+      // The file can also vanish between `existsSync` and the read, which is
+      // the same answer: this snapshot cannot be produced.
+      const reason = isErrnoCode(error, "ENOENT") ? "it disappeared" : "invalid JSON";
+      return {
+        ok: false,
+        problem: "unavailable-dependency",
+        message: `snapshot for ${jobId} is unreadable: ${reason}`,
+      };
+    }
+    if (raw === null || typeof raw !== "object") {
+      return {
+        ok: false,
+        problem: "unavailable-dependency",
+        message: `snapshot for ${jobId} is unreadable: not an object`,
+      };
+    }
     return { ok: true, value: raw };
   }
 
@@ -447,6 +477,12 @@ export class JobStore {
     }
     if (!isValidUlid(jobId)) {
       return { ok: false, problem: "invalid-input", message: `invalid job id: ${jobId}` };
+    }
+    // Existence before the lock. `acquireLock` mkdir -p's the lock's parent, so
+    // locking first left a phantom `jobs/<ulid>/` behind for every mutation of
+    // a job that does not exist — litter any caller could create at will.
+    if (!existsSync(Paths.jobJson(this.root, jobId))) {
+      return { ok: false, problem: "not-found", message: `no job: ${jobId}` };
     }
     const lock = Paths.jobLock(this.root, jobId);
     const audit = Paths.jobAudit(this.root, jobId);
@@ -476,6 +512,15 @@ export class JobStore {
           ok: false,
           problem: "invalid-input",
           message: "mutateJob must increment revision by exactly one",
+        };
+      }
+      // Still ours? If this mutation outlived `staleMs`, another writer may
+      // have broken the lock and read the same revision we did.
+      if (!(await holdsLock(lock))) {
+        return {
+          ok: false,
+          problem: "conflict",
+          message: "lock was broken by another writer during this mutation",
         };
       }
       await writeJsonFile(Paths.jobJson(this.root, jobId), next, {
@@ -510,7 +555,19 @@ export class JobStore {
     if (!existsSync(target)) {
       return { ok: false, problem: "not-found", message: `no idempotency record for hash ${hash}` };
     }
-    const raw = await readJsonFile(target);
+    let raw: unknown;
+    try {
+      raw = await readJsonFile(target);
+    } catch (error) {
+      if (isErrnoCode(error, "ENOENT")) {
+        return { ok: false, problem: "not-found", message: `no idempotency record for hash ${hash}` };
+      }
+      return {
+        ok: false,
+        problem: "unavailable-dependency",
+        message: `idempotency record ${hash} is unreadable: invalid JSON`,
+      };
+    }
     const v = parseIdempotencyRecord(raw);
     if (!v.ok) return v;
     return { ok: true, value: v.value };
@@ -591,6 +648,12 @@ export class JobStore {
    * this method safely — exactly one winner deletes the record.
    */
   async reclaimIdempotencyRecord(hash: string): Promise<StoreOutcome<{ reclaimed: boolean }>> {
+    // This renames and unlinks index records, so it is a mutation and needs the
+    // guard every other mutating method carries. A read-only store accepts no
+    // writes, and "unreachable from today's CLI" is not the same as safe.
+    if (this.readOnly) {
+      return { ok: false, problem: "policy-denied", message: "store is read-only (unknown schema)" };
+    }
     if (!isHexHash(hash)) {
       return { ok: false, problem: "invalid-input", message: `invalid idempotency hash: ${hash}` };
     }
