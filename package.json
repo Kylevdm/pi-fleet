@@ -8,7 +8,7 @@
   },
   "scripts": {
     "rung:0": "tsc --noEmit",
-    "rung:1": "node --experimental-strip-types --test tests/rung1.unit.test.ts",
+    "rung:1": "node --experimental-strip-types --test tests/rung1.unit.test.ts tests/rung1.driver.test.ts",
     "rung:2": "node --experimental-strip-types --test tests/rung2.integration.test.ts",
     "rung:3": "node --experimental-strip-types --test tests/rung3.conformance.test.ts",
     "test": "npm run rung:0 && npm run rung:1 && npm run rung:2 && npm run rung:3"
