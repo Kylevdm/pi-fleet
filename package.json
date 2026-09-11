@@ -1,0 +1,24 @@
+{
+  "name": "pi-fleet",
+  "version": "0.0.0",
+  "description": "Fleet: a delegation module for pi",
+  "type": "module",
+  "bin": {
+    "fleet": "./bin/fleet"
+  },
+  "scripts": {
+    "rung:0": "tsc --noEmit",
+    "rung:1": "node --experimental-strip-types --test tests/rung1.unit.test.ts",
+    "rung:2": "node --experimental-strip-types --test tests/rung2.integration.test.ts",
+    "rung:3": "node --experimental-strip-types --test tests/rung3.conformance.test.ts",
+    "test": "npm run rung:0 && npm run rung:1 && npm run rung:2 && npm run rung:3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.2",
+    "typescript": "^5.8.0"
+  },
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "license": "MIT"
+}
