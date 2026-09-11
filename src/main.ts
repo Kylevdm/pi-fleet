@@ -1,4 +1,5 @@
 import { pathToFileURL } from "node:url";
+import { writeSync } from "node:fs";
 import { faultEnvelope, okEnvelope, problemEnvelope } from "./envelope.ts";
 import type { Envelope, FaultEnvelope, Problem } from "./envelope.ts";
 import { Fleet } from "./fleet.ts";
@@ -19,7 +20,12 @@ const KNOWN_FLAGS = [
   "--limit",
   "--cursor",
   // Value-args for mutations.
+  "--job-id",
   "--expected-revision",
+  // Value-args for `continue`.
+  "--instructions",
+  // Value-args for `wait`.
+  "--timeout",
 ];
 
 /**
@@ -50,19 +56,29 @@ const VERB_TABLE: Record<string, VerbSpec> = {
     valueArgs: ["--limit", "--cursor"],
     boolFlags: ["--include-archived"],
   },
-  wait: {
-    verbs: ["wait"],
-    valueArgs: [],
-    boolFlags: [],
-  },
   cancel: {
     verbs: ["cancel"],
-    valueArgs: ["--expected-revision"],
+    valueArgs: ["--job-id", "--expected-revision"],
+    boolFlags: [],
+  },
+  archive: {
+    verbs: ["archive"],
+    valueArgs: ["--job-id", "--expected-revision"],
+    boolFlags: [],
+  },
+  clean: {
+    verbs: ["clean"],
+    valueArgs: ["--job-id", "--expected-revision"],
+    boolFlags: [],
+  },
+  wait: {
+    verbs: ["wait"],
+    valueArgs: ["--job-id", "--timeout"],
     boolFlags: [],
   },
   continue: {
     verbs: ["continue"],
-    valueArgs: ["--expected-revision"],
+    valueArgs: ["--job-id", "--expected-revision", "--instructions"],
     boolFlags: [],
   },
 };
@@ -84,11 +100,6 @@ interface ListArgs {
   limit: number | undefined;
   cursor: string | undefined;
   includeArchived: boolean;
-}
-
-interface MutationArgs {
-  jobId: string;
-  expectedRevision: number;
 }
 
 /** Boolean flags that do not consume the next token. */
@@ -208,23 +219,11 @@ export function run(argv: string[]): Envelope {
     if (!parsed.ok) return parsed.envelope;
     return problemEnvelope("invalid-input", "list requires async; use bin/fleet");
   }
-  if (verb === "wait") {
-    if (positionals.length < 2) {
-      return problemEnvelope("invalid-input", "fleet wait <jobId> requires a job id");
+  // Mutation and wait verbs need the store — sync surface directs to async.
+  for (const asyncVerb of ["cancel", "archive", "clean", "wait", "continue"]) {
+    if (verb === asyncVerb) {
+      return problemEnvelope("invalid-input", `${verb} requires async; use bin/fleet`);
     }
-    return problemEnvelope("invalid-input", "wait requires async; use bin/fleet");
-  }
-  if (verb === "cancel") {
-    if (positionals.length < 2) {
-      return problemEnvelope("invalid-input", "fleet cancel <jobId> requires a job id");
-    }
-    return problemEnvelope("invalid-input", "cancel requires async; use bin/fleet");
-  }
-  if (verb === "continue") {
-    if (positionals.length < 2) {
-      return problemEnvelope("invalid-input", "fleet continue <jobId> requires a job id");
-    }
-    return problemEnvelope("invalid-input", "continue requires async; use bin/fleet");
   }
   return problemEnvelope("invalid-input", `unknown verb: ${verb}`);
 }
@@ -361,35 +360,116 @@ function parseListArgsFromSplit(split: ReturnType<typeof splitArgs>): ParseResul
   };
 }
 
-function parseMutationArgsFromPositional(
-  positionals: string[],
-  args: readonly string[],
-  verb: string,
-): ParseResult<MutationArgs> {
-  if (positionals.length > 2) {
-    return {
-      ok: false,
-      envelope: problemEnvelope("invalid-input", `fleet ${verb} takes exactly one argument, got ${positionals.length - 1}`),
-    };
-  }
-  const jobId = positionals[1] as string;
-  if (!isValidUlid(jobId)) {
-    return { ok: false, envelope: problemEnvelope("invalid-input", `invalid job id: ${jobId}`) };
-  }
-  const afterVerb = stripVerb(args, verb);
-  const split = splitArgs(afterVerb);
+interface MutationArgs {
+  jobId: string;
+  expectedRevision: number;
+}
+
+interface WaitArgs {
+  jobId: string;
+  timeoutMs: number | undefined;
+}
+
+interface ContinueArgs {
+  jobId: string;
+  expectedRevision: number;
+  instructions: string;
+}
+
+/**
+ * Parse the shared `--job-id` and `--expected-revision` flags from a split
+ * argument list. Returns the parsed pair or a problem envelope.
+ */
+function parseJobIdAndRevision(
+  split: ReturnType<typeof splitArgs>,
+): ParseResult<{ jobId: string; expectedRevision: number }> {
   if (split.error !== undefined) {
     return { ok: false, envelope: problemEnvelope("invalid-input", split.error) };
   }
-  const rawRev = split.valueMap["--expected-revision"];
-  if (rawRev === undefined) {
+  if (split.positionals.length > 0) {
+    return {
+      ok: false,
+      envelope: problemEnvelope("invalid-input", `unexpected positional argument: ${split.positionals[0]}`),
+    };
+  }
+  const values = split.valueMap;
+  const jobId = values["--job-id"];
+  if (typeof jobId !== "string") {
+    return { ok: false, envelope: problemEnvelope("invalid-input", "--job-id is required") };
+  }
+  if (!isValidUlid(jobId)) {
+    return { ok: false, envelope: problemEnvelope("invalid-input", `invalid job id: ${jobId}`) };
+  }
+  const rawRevision = values["--expected-revision"];
+  if (typeof rawRevision !== "string") {
     return { ok: false, envelope: problemEnvelope("invalid-input", "--expected-revision is required") };
   }
-  if (!/^[1-9][0-9]*$/.test(rawRev)) {
-    return { ok: false, envelope: problemEnvelope("invalid-input", `--expected-revision must be a positive integer, got "${rawRev}"`) };
+  if (!/^[1-9][0-9]*$/.test(rawRevision)) {
+    return {
+      ok: false,
+      envelope: problemEnvelope("invalid-input", `--expected-revision must be a positive integer, got "${rawRevision}"`),
+    };
   }
-  const expectedRevision = Number(rawRev);
-  return { ok: true, value: { jobId, expectedRevision } };
+  return {
+    ok: true,
+    value: { jobId, expectedRevision: Number(rawRevision) },
+  };
+}
+
+function parseMutationArgsFromSplit(
+  split: ReturnType<typeof splitArgs>,
+): ParseResult<MutationArgs> {
+  return parseJobIdAndRevision(split);
+}
+
+function parseWaitArgsFromSplit(
+  split: ReturnType<typeof splitArgs>,
+): ParseResult<WaitArgs> {
+  if (split.error !== undefined) {
+    return { ok: false, envelope: problemEnvelope("invalid-input", split.error) };
+  }
+  if (split.positionals.length > 0) {
+    return {
+      ok: false,
+      envelope: problemEnvelope("invalid-input", `unexpected positional argument: ${split.positionals[0]}`),
+    };
+  }
+  const values = split.valueMap;
+  const jobId = values["--job-id"];
+  if (typeof jobId !== "string") {
+    return { ok: false, envelope: problemEnvelope("invalid-input", "--job-id is required") };
+  }
+  if (!isValidUlid(jobId)) {
+    return { ok: false, envelope: problemEnvelope("invalid-input", `invalid job id: ${jobId}`) };
+  }
+  let timeoutMs: number | undefined;
+  const rawTimeout = values["--timeout"];
+  if (rawTimeout !== undefined) {
+    if (!/^[0-9]+$/.test(rawTimeout) || rawTimeout === "0") {
+      return {
+        ok: false,
+        envelope: problemEnvelope("invalid-input", `--timeout must be a positive integer (ms), got "${rawTimeout}"`),
+      };
+    }
+    timeoutMs = Number(rawTimeout);
+  }
+  return { ok: true, value: { jobId, timeoutMs } };
+}
+
+function parseContinueArgsFromSplit(
+  split: ReturnType<typeof splitArgs>,
+): ParseResult<ContinueArgs> {
+  const base = parseJobIdAndRevision(split);
+  if (!base.ok) return base;
+  const values = split.valueMap;
+  const instructions = values["--instructions"];
+  if (typeof instructions !== "string") {
+    return { ok: false, envelope: problemEnvelope("invalid-input", "--instructions is required") };
+  }
+  return {
+    ok: true,
+    value: { ...base.value, instructions },
+  };
 }
 
 /** Convert an `Outcome<T>` to the flat envelope shape the CLI prints. */
@@ -419,7 +499,9 @@ function isMain(): boolean {
  * truncate the one envelope the contract promises.
  */
 function emit(envelope: Envelope | FaultEnvelope, exitCode: number): void {
-  process.stdout.write(JSON.stringify(envelope) + "\n");
+  // stdout is a pipe under programmatic callers. Synchronously write the one
+  // required envelope so a natural process exit cannot drop it.
+  writeSync(process.stdout.fd, JSON.stringify(envelope) + "\n");
   process.exitCode = exitCode;
 }
 
@@ -503,45 +585,30 @@ export async function runAsync(argv: string[]): Promise<Envelope> {
     });
     return outcomeToEnvelope(outcome);
   }
-  if (verb === "wait") {
-    if (positional.length < 2) {
-      return problemEnvelope("invalid-input", "fleet wait <jobId> requires a job id");
-    }
-    if (positional.length > 2) {
-      return problemEnvelope(
-        "invalid-input",
-        `fleet wait takes exactly one argument, got ${positional.length - 1}`,
-      );
-    }
-    const jobId = positional[1] as string;
-    if (!isValidUlid(jobId)) {
-      return problemEnvelope("invalid-input", `invalid job id: ${jobId}`);
-    }
-    const outcome = await fleet.wait({ jobId });
+  if (verb === "cancel" || verb === "archive" || verb === "clean") {
+    const afterVerb = stripVerb(args, verb);
+    const parsed = parseMutationArgsFromSplit(splitArgs(afterVerb));
+    if (!parsed.ok) return parsed.envelope;
+    const outcome =
+      verb === "cancel"
+        ? await fleet.cancel(parsed.value)
+        : verb === "archive"
+          ? await fleet.archive(parsed.value)
+          : await fleet.clean(parsed.value);
     return outcomeToEnvelope(outcome);
   }
-  if (verb === "cancel") {
-    if (positional.length < 2) {
-      return problemEnvelope("invalid-input", "fleet cancel <jobId> requires a job id");
-    }
-    const parsed = parseMutationArgsFromPositional(positional, args, verb);
+  if (verb === "wait") {
+    const afterVerb = stripVerb(args, verb);
+    const parsed = parseWaitArgsFromSplit(splitArgs(afterVerb));
     if (!parsed.ok) return parsed.envelope;
-    const outcome = await fleet.cancel({
-      jobId: parsed.value.jobId,
-      expectedRevision: parsed.value.expectedRevision,
-    });
+    const outcome = await fleet.wait(parsed.value);
     return outcomeToEnvelope(outcome);
   }
   if (verb === "continue") {
-    if (positional.length < 2) {
-      return problemEnvelope("invalid-input", "fleet continue <jobId> requires a job id");
-    }
-    const parsed = parseMutationArgsFromPositional(positional, args, verb);
+    const afterVerb = stripVerb(args, verb);
+    const parsed = parseContinueArgsFromSplit(splitArgs(afterVerb));
     if (!parsed.ok) return parsed.envelope;
-    const outcome = await fleet.continue({
-      jobId: parsed.value.jobId,
-      expectedRevision: parsed.value.expectedRevision,
-    });
+    const outcome = await fleet.continue(parsed.value);
     return outcomeToEnvelope(outcome);
   }
   return problemEnvelope("invalid-input", `unknown verb: ${verb}`);

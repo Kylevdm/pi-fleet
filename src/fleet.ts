@@ -8,6 +8,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { existsSync } from "node:fs";
+import * as fs from "node:fs/promises";
 
 /**
  * Outcome returned by every public Fleet method. Mirrors the `Outcome`
@@ -578,6 +579,63 @@ export class Fleet {
       return mutate;
     }
 
+    return this.get(request.jobId);
+  }
+
+  /** Archive a terminal job without removing its durable artifacts. */
+  async archive(request: MutationRequest): Promise<Outcome<JobView>> {
+    const mutate = await this.store.mutateJob(
+      request.jobId,
+      request.expectedRevision,
+      (current) => {
+        if (current.status !== "cancelled" && current.status !== "returned-to-orchestrator") {
+          return {
+            ok: false,
+            problem: "policy-denied",
+            message: `archive requires status in [cancelled, returned-to-orchestrator], got ${current.status}`,
+          };
+        }
+        return {
+          ok: true,
+          value: {
+            next: { ...current, revision: current.revision + 1, status: "archived", updatedAt: new Date(this.clock()).toISOString() },
+            reason: "archive",
+          },
+        };
+      },
+    );
+    if (!mutate.ok) return mutate;
+    return this.get(request.jobId);
+  }
+
+  /** Remove disposable scratch data from a terminal job, preserving records. */
+  async clean(request: MutationRequest): Promise<Outcome<JobView>> {
+    const mutate = await this.store.mutateJob(
+      request.jobId,
+      request.expectedRevision,
+      (current) => {
+        if (current.status !== "cancelled" && current.status !== "returned-to-orchestrator") {
+          return {
+            ok: false,
+            problem: "policy-denied",
+            message: `clean requires status in [cancelled, returned-to-orchestrator], got ${current.status}`,
+          };
+        }
+        return {
+          ok: true,
+          value: {
+            next: { ...current, revision: current.revision + 1, updatedAt: new Date(this.clock()).toISOString() },
+            reason: "clean",
+          },
+        };
+      },
+    );
+    if (!mutate.ok) return mutate;
+    try {
+      const tmpDir = Paths.tmpDir(this.store.root, request.jobId);
+      for (const entry of await fs.readdir(tmpDir)) await fs.rm(join(tmpDir, entry), { recursive: true, force: true });
+    } catch { /* absent scratch data is already clean */ }
+    await fs.rm(join(Paths.worktreesDir(this.store.root), request.jobId), { recursive: true, force: true });
     return this.get(request.jobId);
   }
 

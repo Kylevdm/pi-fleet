@@ -63,6 +63,23 @@ function adapter(name: string): Adapter {
   return a;
 }
 
+/** A supervisor can advance its stage between a read and a cancellation. */
+async function cancelCurrent(a: Adapter, env: NodeJS.ProcessEnv, jobId: string) {
+  let current = await a.invoke(["get", jobId], env);
+  let result = await a.invoke(
+    ["cancel", "--job-id", jobId, "--expected-revision", String((current.envelope as Record<string, unknown>).revision)],
+    env,
+  );
+  if (result.code !== 0) {
+    current = await a.invoke(["get", jobId], env);
+    result = await a.invoke(
+      ["cancel", "--job-id", jobId, "--expected-revision", String((current.envelope as Record<string, unknown>).revision)],
+      env,
+    );
+  }
+  return result;
+}
+
 async function freshHome(): Promise<NodeJS.ProcessEnv> {
   const home = mkdtempSync(join(tmpdir(), "fleet-r3-"));
   return { ...process.env, PI_FLEET_HOME: home };
@@ -97,7 +114,9 @@ describe("rung 3 conformance", () => {
         assert.strictEqual(code, 0);
         const envObj = envelope as Record<string, unknown>;
         assert.strictEqual(envObj.ok, true);
-        assert.strictEqual(envObj.status, "admitted");
+        // A detached supervisor may claim the job between submit and wait;
+        // the contract here is that neither non-terminal state wakes wait.
+        assert.ok(["admitted", "running", "waiting"].includes(envObj.status as string));
         assert.strictEqual(typeof envObj.jobId, "string");
         assert.strictEqual(typeof envObj.revision, "number");
         assert.deepStrictEqual(envObj.next, ["get", "wait", "cancel"]);
@@ -222,6 +241,117 @@ describe("rung 3 conformance", () => {
         assert.strictEqual(r.code, 0);
         const page = JSON.parse(r.stdout) as Record<string, unknown>;
         assert.strictEqual(page.ok, true);
+      });
+
+      // State machine verb conformance.
+      it("cancel returns a cancelled envelope with the correct next list", async () => {
+        const env = await freshHome();
+        env.PI_FLEET_PI_DELAY_MS = "10000";
+        const repo = await seedRepo();
+        const a = adapter(name);
+        const sub = await a.invoke(
+          ["submit", "--objective", "cancel conformance", "--repo", repo, "--risk", "low"],
+          env,
+        );
+        assert.strictEqual(sub.code, 0);
+        const jobId = (sub.envelope as Record<string, unknown>).jobId as string;
+        const { code, envelope } = await cancelCurrent(a, env, jobId);
+        assert.strictEqual(code, 0);
+        const envObj = envelope as Record<string, unknown>;
+        assert.strictEqual(envObj.ok, true);
+        assert.strictEqual(envObj.status, "cancelled");
+        assert.ok(typeof envObj.revision === "number");
+        assert.deepStrictEqual(envObj.next, ["get", "report", "clean", "archive"]);
+      });
+
+      it("cancel problem envelopes use only the closed problem set", async () => {
+        const env = await freshHome();
+        const a = adapter(name);
+        const cases: ReadonlyArray<readonly string[]> = [
+          ["cancel", "--expected-revision", "1"], // missing --job-id
+          ["cancel", "--job-id", "not-a-ulid", "--expected-revision", "1"],
+          ["cancel", "--job-id", "01JQQ000000000000000000000", "--expected-revision", "abc"],
+        ];
+        for (const args of cases) {
+          const { code, envelope } = await a.invoke(args, env);
+          assert.strictEqual(code, 1, `expected exit 1 for ${args.join(" ")}`);
+          const envObj = envelope as Record<string, unknown>;
+          assert.strictEqual(envObj.ok, false);
+          assert.ok(
+            (PROBLEMS as readonly string[]).includes(envObj.problem as string),
+            `unknown problem: ${String(envObj.problem)}`,
+          );
+        }
+      });
+
+      it("archive returns an archived envelope with the correct next list", async () => {
+        const env = await freshHome();
+        env.PI_FLEET_PI_DELAY_MS = "10000";
+        const repo = await seedRepo();
+        const a = adapter(name);
+        const sub = await a.invoke(
+          ["submit", "--objective", "archive conformance", "--repo", repo, "--risk", "low"],
+          env,
+        );
+        assert.strictEqual(sub.code, 0);
+        const jobId = (sub.envelope as Record<string, unknown>).jobId as string;
+        // Cancel first.
+        const cancelled = await cancelCurrent(a, env, jobId);
+        // Archive.
+        const { code, envelope } = await a.invoke(
+          ["archive", "--job-id", jobId, "--expected-revision", String((cancelled.envelope as Record<string, unknown>).revision)],
+          env,
+        );
+        assert.strictEqual(code, 0);
+        const envObj = envelope as Record<string, unknown>;
+        assert.strictEqual(envObj.ok, true);
+        assert.strictEqual(envObj.status, "archived");
+        assert.ok(typeof envObj.revision === "number");
+        assert.deepStrictEqual(envObj.next, ["get", "report", "purge"]);
+      });
+
+      it("wait returns a timedOut envelope for a non-terminal job", async () => {
+        const env = await freshHome();
+        const repo = await seedRepo();
+        const a = adapter(name);
+        const sub = await a.invoke(
+          ["submit", "--objective", "wait conformance", "--repo", repo, "--risk", "low"],
+          env,
+        );
+        assert.strictEqual(sub.code, 0);
+        const jobId = (sub.envelope as Record<string, unknown>).jobId as string;
+        const { code, envelope } = await a.invoke(
+          ["wait", "--job-id", jobId, "--timeout", "100"],
+          env,
+        );
+        assert.strictEqual(code, 0);
+        const envObj = envelope as Record<string, unknown>;
+        assert.strictEqual(envObj.ok, true);
+        assert.strictEqual(envObj.timedOut, true);
+        assert.ok(["admitted", "running", "waiting"].includes(envObj.status as string));
+      });
+
+      it("wait on a cancelled job returns timedOut false", async () => {
+        const env = await freshHome();
+        env.PI_FLEET_PI_DELAY_MS = "10000";
+        const repo = await seedRepo();
+        const a = adapter(name);
+        const sub = await a.invoke(
+          ["submit", "--objective", "wait wake", "--repo", repo, "--risk", "low"],
+          env,
+        );
+        assert.strictEqual(sub.code, 0);
+        const jobId = (sub.envelope as Record<string, unknown>).jobId as string;
+        await cancelCurrent(a, env, jobId);
+        const { code, envelope } = await a.invoke(
+          ["wait", "--job-id", jobId, "--timeout", "5000"],
+          env,
+        );
+        assert.strictEqual(code, 0);
+        const envObj = envelope as Record<string, unknown>;
+        assert.strictEqual(envObj.ok, true);
+        assert.strictEqual(envObj.timedOut, false);
+        assert.strictEqual(envObj.status, "cancelled");
       });
     });
   }

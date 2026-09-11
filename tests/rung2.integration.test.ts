@@ -511,7 +511,7 @@ describe("ticket 26 rung 2 integration", () => {
     const result = await new Promise<Run>((resolve, reject) => {
       execFile(
         binary,
-        ["cancel", jobId, "--expected-revision", String(revision), "--json"],
+        ["cancel", "--job-id", jobId, "--expected-revision", String(revision), "--json"],
         { env },
         (error, stdout, stderr) => {
           if (error && typeof error.code === "string") { reject(error); return; }
