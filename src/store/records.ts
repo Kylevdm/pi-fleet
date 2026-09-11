@@ -18,6 +18,12 @@ export const JOB_STATUSES = [
 
 export type JobStatus = (typeof JOB_STATUSES)[number];
 
+export const STAGE_STATES = ["planned", "active", "sealed"] as const;
+export type StageState = (typeof STAGE_STATES)[number];
+
+export const WAITING_REASONS = ["capacity", "provider-recovery", "primary-instructions"] as const;
+export type WaitingReason = (typeof WAITING_REASONS)[number];
+
 /** Risk class the spec admits. Anything else is `invalid-input`. */
 export const RISK_CLASSES = ["low", "medium"] as const;
 export type RiskClass = (typeof RISK_CLASSES)[number];
@@ -66,6 +72,9 @@ const KNOWN_MAJORS: Readonly<Record<string, readonly number[]>> = {
   "input-snapshot": [1],
   "idempotency-index": [1],
   audit: [1],
+  "supervisor-lease": [1],
+  capacity: [1],
+  stage: [1],
 };
 
 /** True when this binary knows the (type, major) pair. */
@@ -145,6 +154,114 @@ export interface JobRecord {
   repo: string;
   createdAt: string;
   updatedAt: string;
+  stage?: string | null;
+  stageState?: StageState | null;
+  waitingReason?: WaitingReason | null;
+}
+
+export interface SupervisorLeaseRecord {
+  schema: "supervisor-lease/1";
+  owner: { pid: number; bootToken: string };
+  generation: number;
+  claimedAt: string;
+  expiresAt: string;
+}
+
+export function validateSupervisorLeaseRecord(value: unknown): ValidationResult<SupervisorLeaseRecord> {
+  if (value === null || typeof value !== "object") {
+    return fail("invalid-input", "supervisor lease must be an object");
+  }
+  const obj = value as Record<string, unknown>;
+  const tag = parseSchemaTag(obj.schema);
+  if (tag === null) return fail("invalid-input", "supervisor lease missing or malformed schema tag");
+  if (tag.type !== "supervisor-lease") {
+    return fail("invalid-input", `expected a supervisor-lease record, found ${tag.type}`);
+  }
+  if (!knownSchemaMajor("supervisor-lease", tag.major)) {
+    return fail("policy-denied", `unknown supervisor-lease schema major: ${tag.major}`);
+  }
+  const owner = obj.owner;
+  if (owner === null || typeof owner !== "object") {
+    return fail("invalid-input", "supervisor lease owner must be an object");
+  }
+  const ownerObj = owner as Record<string, unknown>;
+  if (typeof ownerObj.pid !== "number" || !Number.isInteger(ownerObj.pid)) {
+    return fail("invalid-input", "supervisor lease owner.pid must be an integer");
+  }
+  if (typeof ownerObj.bootToken !== "string" || ownerObj.bootToken.length === 0) {
+    return fail("invalid-input", "supervisor lease owner.bootToken must be a non-empty string");
+  }
+  if (typeof obj.generation !== "number" || !Number.isInteger(obj.generation) || obj.generation < 1) {
+    return fail("invalid-input", "supervisor lease generation must be a positive integer");
+  }
+  if (typeof obj.claimedAt !== "string" || !Number.isFinite(Date.parse(obj.claimedAt))) {
+    return fail("invalid-input", "supervisor lease claimedAt must be an ISO string");
+  }
+  if (typeof obj.expiresAt !== "string" || !Number.isFinite(Date.parse(obj.expiresAt))) {
+    return fail("invalid-input", "supervisor lease expiresAt must be an ISO string");
+  }
+  return ok({
+    schema: schemaTag("supervisor-lease", tag.major) as SupervisorLeaseRecord["schema"],
+    owner: { pid: ownerObj.pid, bootToken: ownerObj.bootToken },
+    generation: obj.generation,
+    claimedAt: obj.claimedAt,
+    expiresAt: obj.expiresAt,
+  });
+}
+
+export interface CapacityRecord {
+  schema: "capacity/1";
+  owner: { pid: number; bootToken: string };
+  jobId: string;
+  repoId: string | null;
+  claimedAt: string;
+  expiresAt: string;
+}
+
+export function validateCapacityRecord(value: unknown): ValidationResult<CapacityRecord> {
+  if (value === null || typeof value !== "object") {
+    return fail("invalid-input", "capacity record must be an object");
+  }
+  const obj = value as Record<string, unknown>;
+  const tag = parseSchemaTag(obj.schema);
+  if (tag === null) return fail("invalid-input", "capacity record missing or malformed schema tag");
+  if (tag.type !== "capacity") {
+    return fail("invalid-input", `expected a capacity record, found ${tag.type}`);
+  }
+  if (!knownSchemaMajor("capacity", tag.major)) {
+    return fail("policy-denied", `unknown capacity schema major: ${tag.major}`);
+  }
+  const owner = obj.owner;
+  if (owner === null || typeof owner !== "object") {
+    return fail("invalid-input", "capacity record owner must be an object");
+  }
+  const ownerObj = owner as Record<string, unknown>;
+  if (typeof ownerObj.pid !== "number" || !Number.isInteger(ownerObj.pid)) {
+    return fail("invalid-input", "capacity record owner.pid must be an integer");
+  }
+  if (typeof ownerObj.bootToken !== "string" || ownerObj.bootToken.length === 0) {
+    return fail("invalid-input", "capacity record owner.bootToken must be a non-empty string");
+  }
+  if (typeof obj.jobId !== "string" || !isValidUlid(obj.jobId)) {
+    return fail("invalid-input", "capacity record jobId must be a ULID");
+  }
+  if (obj.repoId !== null && (typeof obj.repoId !== "string" || obj.repoId.length === 0)) {
+    return fail("invalid-input", "capacity record repoId must be a non-empty string or null");
+  }
+  if (typeof obj.claimedAt !== "string" || !Number.isFinite(Date.parse(obj.claimedAt))) {
+    return fail("invalid-input", "capacity record claimedAt must be an ISO string");
+  }
+  if (typeof obj.expiresAt !== "string" || !Number.isFinite(Date.parse(obj.expiresAt))) {
+    return fail("invalid-input", "capacity record expiresAt must be an ISO string");
+  }
+  return ok({
+    schema: schemaTag("capacity", tag.major) as CapacityRecord["schema"],
+    owner: { pid: ownerObj.pid, bootToken: ownerObj.bootToken },
+    jobId: obj.jobId,
+    repoId: obj.repoId as string | null,
+    claimedAt: obj.claimedAt,
+    expiresAt: obj.expiresAt,
+  });
 }
 
 export function validateJobRecord(value: unknown): ValidationResult<JobRecord> {
@@ -181,6 +298,26 @@ export function validateJobRecord(value: unknown): ValidationResult<JobRecord> {
   if (typeof obj.updatedAt !== "string") {
     return fail("invalid-input", "job record updatedAt must be an ISO string");
   }
+  const stage = obj.stage === undefined ? null : obj.stage;
+  if (stage !== null && typeof stage !== "string") {
+    return fail("invalid-input", "job record stage must be a string or null");
+  }
+  const rawStageState = obj.stageState === undefined ? null : obj.stageState;
+  const stageState: StageState | null =
+    rawStageState === null ? null :
+    (STAGE_STATES as readonly string[]).includes(rawStageState as string) ? (rawStageState as StageState) :
+    null;
+  if (rawStageState !== null && stageState === null) {
+    return fail("invalid-input", `job record stageState must be planned, active, or sealed, got ${String(rawStageState)}`);
+  }
+  const rawWaitingReason = obj.waitingReason === undefined ? null : obj.waitingReason;
+  const waitingReason: WaitingReason | null =
+    rawWaitingReason === null ? null :
+    (WAITING_REASONS as readonly string[]).includes(rawWaitingReason as string) ? (rawWaitingReason as WaitingReason) :
+    null;
+  if (rawWaitingReason !== null && waitingReason === null) {
+    return fail("invalid-input", `job record waitingReason must be capacity, provider-recovery, or primary-instructions, got ${String(rawWaitingReason)}`);
+  }
   return ok({
     schema: schemaTag("job", tag.major) as JobRecord["schema"],
     jobId: obj.jobId,
@@ -190,5 +327,8 @@ export function validateJobRecord(value: unknown): ValidationResult<JobRecord> {
     repo: obj.repo,
     createdAt: obj.createdAt,
     updatedAt: obj.updatedAt,
+    stage: stage as string | null,
+    stageState: stageState as StageState | null,
+    waitingReason: waitingReason as WaitingReason | null,
   });
 }

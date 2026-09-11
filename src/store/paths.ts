@@ -1,6 +1,7 @@
 import { existsSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve, sep } from "node:path";
+import { createHash } from "node:crypto";
 
 /**
  * Composition seams the store talks through. Tests inject a fake `homedir`;
@@ -43,6 +44,11 @@ export function resolveStoreRoot(env: PathEnvironment = DEFAULT_ENV): string {
  */
 export function storePath(root: string, ...parts: readonly string[]): string {
   return join(root, ...parts);
+}
+
+/** Compute a stable repoId from a repo realpath (first 16 hex of sha256). */
+export function repoIdFromRealpath(repo: string): string {
+  return createHash("sha256").update(repo, "utf8").digest("hex").slice(0, 16);
 }
 
 /**

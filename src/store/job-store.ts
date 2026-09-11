@@ -15,14 +15,22 @@ import {
   LockHeldError,
   holdsLock,
 } from "./atomic.ts";
-import { storePath, ensureWithinRoot } from "./paths.ts";
+import { storePath, ensureWithinRoot, repoIdFromRealpath } from "./paths.ts";
 import { isValidUlid } from "../ulid.ts";
 import type {
   JobRecord as JobRecordType,
   JobStatus,
   RiskClass,
+  SupervisorLeaseRecord,
+  CapacityRecord,
 } from "./records.ts";
-import { schemaTag, validateJobRecord, validateStoreRecord } from "./records.ts";
+import {
+  schemaTag,
+  validateJobRecord,
+  validateStoreRecord,
+  validateSupervisorLeaseRecord,
+  validateCapacityRecord,
+} from "./records.ts";
 import type { Problem } from "../envelope.ts";
 import type { ValidationResult } from "./records.ts";
 
@@ -61,6 +69,18 @@ export const Paths = {
   tmpDir(root: string, jobId: string): string {
     return storePath(root, "jobs", jobId, "tmp");
   },
+  supervisorLease(root: string, jobId: string): string {
+    return storePath(root, "jobs", jobId, "supervisor-lease.json");
+  },
+  stageDir(root: string, jobId: string, stageIndex: number): string {
+    return storePath(root, "jobs", jobId, "stages", String(stageIndex));
+  },
+  stageArtifact(root: string, jobId: string, stageIndex: number): string {
+    return storePath(root, "jobs", jobId, "stages", String(stageIndex), "artifact.json");
+  },
+  piPid(root: string, jobId: string): string {
+    return storePath(root, "jobs", jobId, "pi-pid.txt");
+  },
   idempotencyIndex(root: string): string {
     return storePath(root, "index", "idempotency");
   },
@@ -69,6 +89,15 @@ export const Paths = {
   },
   capacityDir(root: string): string {
     return storePath(root, "capacity");
+  },
+  capacityGlobalDir(root: string): string {
+    return storePath(root, "capacity", "global");
+  },
+  capacityRepoDir(root: string): string {
+    return storePath(root, "capacity", "repos");
+  },
+  capacityRepoRecord(root: string, repoId: string): string {
+    return storePath(root, "capacity", "repos", `${repoId}.json`);
   },
   worktreesDir(root: string): string {
     return storePath(root, "worktrees");
@@ -471,6 +500,7 @@ export class JobStore {
       next: JobRecordType;
       reason: string;
     }>,
+    options: { leaseGeneration?: number } = {},
   ): Promise<StoreOutcome<JobRecordType>> {
     if (this.readOnly) {
       return { ok: false, problem: "policy-denied", message: "store is read-only (unknown schema)" };
@@ -503,6 +533,16 @@ export class JobStore {
           problem: "conflict",
           message: `expected revision ${expectedRevision}, found ${current.value.revision}`,
         };
+      }
+      if (options.leaseGeneration !== undefined) {
+        const lease = await this.readSupervisorLease(jobId);
+        if (lease.ok && lease.value.generation !== options.leaseGeneration) {
+          return {
+            ok: false,
+            problem: "conflict",
+            message: `expected lease generation ${options.leaseGeneration}, found ${lease.value.generation}`,
+          };
+        }
       }
       const outcome = fn(current.value);
       if (!outcome.ok) return outcome;
@@ -686,6 +726,306 @@ export class JobStore {
     }
     await fs.unlink(aside).catch(() => {});
     return { ok: true, value: { reclaimed: true } };
+  }
+
+  // ---- Supervisor lease ----
+
+  async readSupervisorLease(jobId: string): Promise<StoreOutcome<SupervisorLeaseRecord>> {
+    if (!isValidUlid(jobId)) {
+      return { ok: false, problem: "invalid-input", message: `invalid job id: ${jobId}` };
+    }
+    const target = Paths.supervisorLease(this.root, jobId);
+    if (!existsSync(target)) {
+      return { ok: false, problem: "not-found", message: `no supervisor lease: ${jobId}` };
+    }
+    let raw: unknown;
+    try {
+      raw = await readJsonFile(target);
+    } catch {
+      return { ok: false, problem: "unavailable-dependency", message: `supervisor lease unreadable: ${jobId}` };
+    }
+    const validated = validateSupervisorLeaseRecord(raw);
+    if (!validated.ok) {
+      return { ok: false, problem: "unavailable-dependency", message: `supervisor lease invalid: ${validated.message}` };
+    }
+    return { ok: true, value: validated.value };
+  }
+
+  /**
+   * Claim or renew the supervisor lease for a job. If a lease exists and is
+   * still live (not past expiry + grace), the claim is rejected. Otherwise
+   * the old lease is replaced with a new one of the next generation.
+   */
+  async claimSupervisorLease(
+    jobId: string,
+    owner: { pid: number; bootToken: string },
+    leaseDurationMs: number,
+  ): Promise<StoreOutcome<{ claimed: boolean; generation: number }>> {
+    if (this.readOnly) {
+      return { ok: false, problem: "policy-denied", message: "store is read-only (unknown schema)" };
+    }
+    if (!isValidUlid(jobId)) {
+      return { ok: false, problem: "invalid-input", message: `invalid job id: ${jobId}` };
+    }
+    const target = Paths.supervisorLease(this.root, jobId);
+    const now = Date.now();
+    const graceMs = 30_000;
+
+    let nextGeneration = 1;
+    if (existsSync(target)) {
+      const current = await this.readSupervisorLease(jobId);
+      if (current.ok) {
+        const expired = now - Date.parse(current.value.expiresAt) > graceMs;
+        if (!expired) {
+          // Still live.
+          return { ok: true, value: { claimed: false, generation: current.value.generation } };
+        }
+        nextGeneration = current.value.generation + 1;
+      }
+      // If unreadable, treat as reclaimable and start at generation 1.
+    }
+
+    const record: SupervisorLeaseRecord = {
+      schema: "supervisor-lease/1",
+      owner,
+      generation: nextGeneration,
+      claimedAt: new Date(now).toISOString(),
+      expiresAt: new Date(now + leaseDurationMs).toISOString(),
+    };
+    await fs.mkdir(Paths.jobDir(this.root, jobId), { recursive: true });
+    await writeJsonFile(target, record, { pretty: true, scratchDir: Paths.tmpDir(this.root, jobId) });
+    return { ok: true, value: { claimed: true, generation: nextGeneration } };
+  }
+
+  /**
+   * Break the supervisor lease so another supervisor (or cancel) can claim
+   * the job immediately. Returns true when a lease was removed.
+   */
+  async breakSupervisorLease(jobId: string): Promise<StoreOutcome<boolean>> {
+    if (this.readOnly) {
+      return { ok: false, problem: "policy-denied", message: "store is read-only (unknown schema)" };
+    }
+    if (!isValidUlid(jobId)) {
+      return { ok: false, problem: "invalid-input", message: `invalid job id: ${jobId}` };
+    }
+    const target = Paths.supervisorLease(this.root, jobId);
+    if (!existsSync(target)) {
+      return { ok: true, value: false };
+    }
+    try {
+      await fs.unlink(target);
+      return { ok: true, value: true };
+    } catch (error) {
+      if (isErrnoCode(error, "ENOENT")) return { ok: true, value: false };
+      throw error;
+    }
+  }
+
+  // ---- Capacity leases ----
+
+  /**
+   * Try to acquire both a global writer slot and a per-repository writer
+   * slot. Returns the acquired capacity record or null if either is
+   * unavailable. Cleans up expired leases before counting.
+   */
+  async acquireCapacity(
+    jobId: string,
+    repoId: string,
+    owner: { pid: number; bootToken: string },
+    leaseDurationMs: number,
+  ): Promise<StoreOutcome<{ acquired: boolean; globalSlot: number; repoSlot: number }>> {
+    if (this.readOnly) {
+      return { ok: false, problem: "policy-denied", message: "store is read-only (unknown schema)" };
+    }
+    if (!isValidUlid(jobId)) {
+      return { ok: false, problem: "invalid-input", message: `invalid job id: ${jobId}` };
+    }
+
+    const globalDir = Paths.capacityGlobalDir(this.root);
+    const repoFile = Paths.capacityRepoRecord(this.root, repoId);
+    await fs.mkdir(globalDir, { recursive: true });
+    await fs.mkdir(Paths.capacityRepoDir(this.root), { recursive: true });
+
+    const now = Date.now();
+    const expiresAt = new Date(now + leaseDurationMs).toISOString();
+
+    // Clean up expired global leases and count live ones.
+    let liveGlobals = 0;
+    if (existsSync(globalDir)) {
+      const entries = await fs.readdir(globalDir);
+      for (const e of entries) {
+        if (!e.endsWith(".json")) continue;
+        const p = join(globalDir, e);
+        let raw: unknown;
+        try {
+          raw = await readJsonFile(p);
+        } catch {
+          await fs.unlink(p).catch(() => {});
+          continue;
+        }
+        const v = validateCapacityRecord(raw);
+        if (!v.ok || Date.parse(v.value.expiresAt) < now) {
+          await fs.unlink(p).catch(() => {});
+          continue;
+        }
+        liveGlobals += 1;
+      }
+    }
+
+    // Clean up expired repo lease.
+    let liveRepo = false;
+    if (existsSync(repoFile)) {
+      let raw: unknown;
+      try {
+        raw = await readJsonFile(repoFile);
+      } catch {
+        await fs.unlink(repoFile).catch(() => {});
+      }
+      if (raw !== null) {
+        const v = validateCapacityRecord(raw);
+        if (!v.ok || Date.parse(v.value.expiresAt) < now) {
+          await fs.unlink(repoFile).catch(() => {});
+        } else {
+          liveRepo = true;
+        }
+      }
+    }
+
+    if (liveGlobals >= 3 || liveRepo) {
+      return { ok: true, value: { acquired: false, globalSlot: liveGlobals, repoSlot: liveRepo ? 1 : 0 } };
+    }
+
+    const record: CapacityRecord = {
+      schema: "capacity/1",
+      owner,
+      jobId,
+      repoId,
+      claimedAt: new Date(now).toISOString(),
+      expiresAt,
+    };
+
+    // Write global slot.
+    const globalFile = join(globalDir, `${jobId}.json`);
+    await writeJsonFile(globalFile, record, { pretty: true, scratchDir: Paths.tmpDir(this.root, jobId) });
+
+    // Write repo slot.
+    await writeJsonFile(repoFile, record, { pretty: true, scratchDir: Paths.tmpDir(this.root, jobId) });
+
+    return { ok: true, value: { acquired: true, globalSlot: liveGlobals + 1, repoSlot: 1 } };
+  }
+
+  /**
+   * Release all capacity held by a job (global and any repo slots).
+   */
+  async releaseCapacity(jobId: string): Promise<StoreOutcome<void>> {
+    if (this.readOnly) {
+      return { ok: false, problem: "policy-denied", message: "store is read-only (unknown schema)" };
+    }
+    if (!isValidUlid(jobId)) {
+      return { ok: false, problem: "invalid-input", message: `invalid job id: ${jobId}` };
+    }
+    const globalFile = join(Paths.capacityGlobalDir(this.root), `${jobId}.json`);
+    if (existsSync(globalFile)) {
+      await fs.unlink(globalFile).catch(() => {});
+    }
+    // Also scan repo dir for any capacity record matching this jobId.
+    const repoDir = Paths.capacityRepoDir(this.root);
+    if (existsSync(repoDir)) {
+      const entries = await fs.readdir(repoDir).catch(() => [] as string[]);
+      for (const e of entries) {
+        if (!e.endsWith(".json")) continue;
+        const p = join(repoDir, e);
+        let raw: unknown;
+        try {
+          raw = await readJsonFile(p);
+        } catch {
+          continue;
+        }
+        if (raw !== null && typeof raw === "object" && (raw as Record<string, unknown>).jobId === jobId) {
+          await fs.unlink(p).catch(() => {});
+        }
+      }
+    }
+    return { ok: true, value: undefined };
+  }
+
+  // ---- Stage artifacts ----
+
+  async stageArtifactExists(jobId: string, stageIndex: number): Promise<boolean> {
+    if (!isValidUlid(jobId)) return false;
+    return existsSync(Paths.stageArtifact(this.root, jobId, stageIndex));
+  }
+
+  async writeStageArtifact(
+    jobId: string,
+    stageIndex: number,
+    payload: unknown,
+  ): Promise<StoreOutcome<void>> {
+    if (this.readOnly) {
+      return { ok: false, problem: "policy-denied", message: "store is read-only (unknown schema)" };
+    }
+    if (!isValidUlid(jobId)) {
+      return { ok: false, problem: "invalid-input", message: `invalid job id: ${jobId}` };
+    }
+    const dir = Paths.stageDir(this.root, jobId, stageIndex);
+    await fs.mkdir(dir, { recursive: true });
+    const target = Paths.stageArtifact(this.root, jobId, stageIndex);
+    await writeJsonFile(target, payload, { pretty: true, scratchDir: Paths.tmpDir(this.root, jobId) });
+    return { ok: true, value: undefined };
+  }
+
+  async readStageArtifact(jobId: string, stageIndex: number): Promise<StoreOutcome<unknown>> {
+    if (!isValidUlid(jobId)) {
+      return { ok: false, problem: "invalid-input", message: `invalid job id: ${jobId}` };
+    }
+    const target = Paths.stageArtifact(this.root, jobId, stageIndex);
+    if (!existsSync(target)) {
+      return { ok: false, problem: "not-found", message: `no artifact for stage ${stageIndex}` };
+    }
+    let raw: unknown;
+    try {
+      raw = await readJsonFile(target);
+    } catch {
+      return { ok: false, problem: "unavailable-dependency", message: `artifact unreadable for stage ${stageIndex}` };
+    }
+    return { ok: true, value: raw };
+  }
+
+  // ---- Pi pid tracking ----
+
+  async writePiPid(jobId: string, pid: number): Promise<StoreOutcome<void>> {
+    if (this.readOnly) {
+      return { ok: false, problem: "policy-denied", message: "store is read-only (unknown schema)" };
+    }
+    if (!isValidUlid(jobId)) {
+      return { ok: false, problem: "invalid-input", message: `invalid job id: ${jobId}` };
+    }
+    const target = Paths.piPid(this.root, jobId);
+    await writeStringFileAtomic(target, String(pid), { scratchDir: Paths.tmpDir(this.root, jobId) });
+    return { ok: true, value: undefined };
+  }
+
+  async readPiPid(jobId: string): Promise<StoreOutcome<number>> {
+    if (!isValidUlid(jobId)) {
+      return { ok: false, problem: "invalid-input", message: `invalid job id: ${jobId}` };
+    }
+    const target = Paths.piPid(this.root, jobId);
+    if (!existsSync(target)) {
+      return { ok: false, problem: "not-found", message: `no pi pid: ${jobId}` };
+    }
+    const text = await fs.readFile(target, "utf8");
+    const pid = Number.parseInt(text.trim(), 10);
+    if (!Number.isFinite(pid)) {
+      return { ok: false, problem: "unavailable-dependency", message: `invalid pi pid: ${jobId}` };
+    }
+    return { ok: true, value: pid };
+  }
+
+  async deletePiPid(jobId: string): Promise<void> {
+    const target = Paths.piPid(this.root, jobId);
+    if (existsSync(target)) {
+      await fs.unlink(target).catch(() => {});
+    }
   }
 }
 

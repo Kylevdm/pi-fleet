@@ -1,4 +1,5 @@
 import { pathToFileURL } from "node:url";
+import { writeSync } from "node:fs";
 import { faultEnvelope, okEnvelope, problemEnvelope } from "./envelope.ts";
 import type { Envelope, FaultEnvelope, Problem } from "./envelope.ts";
 import { Fleet } from "./fleet.ts";
@@ -498,7 +499,9 @@ function isMain(): boolean {
  * truncate the one envelope the contract promises.
  */
 function emit(envelope: Envelope | FaultEnvelope, exitCode: number): void {
-  process.stdout.write(JSON.stringify(envelope) + "\n");
+  // stdout is a pipe under programmatic callers. Synchronously write the one
+  // required envelope so a natural process exit cannot drop it.
+  writeSync(process.stdout.fd, JSON.stringify(envelope) + "\n");
   process.exitCode = exitCode;
 }
 

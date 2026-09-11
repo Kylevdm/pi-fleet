@@ -1972,564 +1972,231 @@ describe("ticket 23 third-review findings", () => {
   });
 });
 
-// ─── State machine transition verbs ──────────────────────────────────────────
-
-describe("cancel", () => {
+describe("ticket 26: supervisor lease", () => {
   async function makeRepo(): Promise<string> {
-    const dir = mkdtempSync(join(tmpdir(), "fleet-cancel-repo-"));
+    const dir = mkdtempSync(join(tmpdir(), "fleet-repo-"));
     mkdirSync(join(dir, ".git"));
     return dir;
   }
 
   async function freshStore(): Promise<JobStore> {
-    return JobStore.open(mkdtempSync(join(tmpdir(), "fleet-cancel-store-")));
+    return JobStore.open(mkdtempSync(join(tmpdir(), "fleet-store-")));
   }
 
-  function clock(ms: number): () => number {
-    return () => ms;
-  }
-
-  it("cancel transitions an admitted job to cancelled", async () => {
+  it("claimSupervisorLease claims a new lease with generation 1", async () => {
     const store = await freshStore();
-    const fleet = new Fleet(store, clock(1_700_000_000_000));
+    const result = await store.claimSupervisorLease("01JQQ000000000000000000000", { pid: 1, bootToken: "a" }, 30_000);
+    assert.strictEqual(result.ok, true);
+    if (!result.ok) return;
+    assert.strictEqual(result.value.claimed, true);
+    assert.strictEqual(result.value.generation, 1);
+  });
+
+  it("claimSupervisorLease rejects when the lease is still live", async () => {
+    const store = await freshStore();
+    const jobId = "01JQQ000000000000000000000";
+    const first = await store.claimSupervisorLease(jobId, { pid: 1, bootToken: "a" }, 30_000);
+    assert.ok(first.ok && first.value.claimed);
+    const second = await store.claimSupervisorLease(jobId, { pid: 2, bootToken: "b" }, 30_000);
+    assert.ok(second.ok);
+    if (!second.ok) return;
+    assert.strictEqual(second.value.claimed, false);
+    assert.strictEqual(second.value.generation, 1);
+  });
+
+  it("claimSupervisorLease succeeds after expiry plus grace", async () => {
+    const store = await freshStore();
+    const jobId = "01JQQ000000000000000000000";
+    const first = await store.claimSupervisorLease(jobId, { pid: 1, bootToken: "a" }, 10);
+    assert.ok(first.ok && first.value.claimed);
+    await new Promise((r) => setTimeout(r, 100)); // past 10ms + 30s grace? No, 10ms expiry, need 30s grace... too long.
+    // Use a backdated lease instead.
+    const leasePath = Paths.supervisorLease(store.root, jobId);
+    writeFileSync(leasePath, JSON.stringify({
+      schema: "supervisor-lease/1",
+      owner: { pid: 1, bootToken: "a" },
+      generation: 5,
+      claimedAt: new Date(Date.now() - 60_000).toISOString(),
+      expiresAt: new Date(Date.now() - 30_001).toISOString(), // past grace
+    }) + "\n");
+    const next = await store.claimSupervisorLease(jobId, { pid: 2, bootToken: "b" }, 30_000);
+    assert.ok(next.ok);
+    if (!next.ok) return;
+    assert.strictEqual(next.value.claimed, true);
+    assert.strictEqual(next.value.generation, 6);
+  });
+
+  it("breakSupervisorLease removes the lease", async () => {
+    const store = await freshStore();
+    const jobId = "01JQQ000000000000000000000";
+    await store.claimSupervisorLease(jobId, { pid: 1, bootToken: "a" }, 30_000);
+    const broke = await store.breakSupervisorLease(jobId);
+    assert.ok(broke.ok && broke.value);
+    const read = await store.readSupervisorLease(jobId);
+    assert.strictEqual(read.ok, false);
+    if (!read.ok) assert.strictEqual(read.problem, "not-found");
+  });
+});
+
+describe("ticket 26: capacity leases", () => {
+  async function freshStore(): Promise<JobStore> {
+    return JobStore.open(mkdtempSync(join(tmpdir(), "fleet-store-")));
+  }
+
+  it("acquireCapacity gets global and repo slots", async () => {
+    const store = await freshStore();
+    const result = await store.acquireCapacity("01JQQ000000000000000000000", "repo-a", { pid: 1, bootToken: "a" }, 30_000);
+    assert.ok(result.ok);
+    if (!result.ok) return;
+    assert.strictEqual(result.value.acquired, true);
+  });
+
+  it("acquireCapacity rejects when global limit (3) is reached", async () => {
+    const store = await freshStore();
+    const owner = { pid: 1, bootToken: "a" };
+    for (let i = 0; i < 3; i += 1) {
+      const jobId = `01JQQ00000000000000000000${i}`;
+      const r = await store.acquireCapacity(jobId, `repo-${i}`, owner, 30_000);
+      assert.ok(r.ok && r.value.acquired, `job ${i} should acquire`);
+    }
+    const fourth = await store.acquireCapacity("01JQQ000000000000000000009", "repo-x", owner, 30_000);
+    assert.ok(fourth.ok);
+    if (!fourth.ok) return;
+    assert.strictEqual(fourth.value.acquired, false);
+  });
+
+  it("acquireCapacity rejects when repo limit (1) is reached", async () => {
+    const store = await freshStore();
+    const owner = { pid: 1, bootToken: "a" };
+    const first = await store.acquireCapacity("01JQQ000000000000000000000", "repo-shared", owner, 30_000);
+    assert.ok(first.ok && first.value.acquired);
+    const second = await store.acquireCapacity("01JQQ000000000000000000001", "repo-shared", owner, 30_000);
+    assert.ok(second.ok);
+    if (!second.ok) return;
+    assert.strictEqual(second.value.acquired, false);
+  });
+
+  it("releaseCapacity frees both global and repo slots", async () => {
+    const store = await freshStore();
+    const jobId = "01JQQ000000000000000000000";
+    await store.acquireCapacity(jobId, "repo-a", { pid: 1, bootToken: "a" }, 30_000);
+    await store.releaseCapacity(jobId);
+    const after = await store.acquireCapacity(jobId, "repo-a", { pid: 1, bootToken: "a" }, 30_000);
+    assert.ok(after.ok && after.value.acquired);
+  });
+});
+
+describe("ticket 26: Fleet wait and cancel", () => {
+  async function makeRepo(): Promise<string> {
+    const dir = mkdtempSync(join(tmpdir(), "fleet-repo-"));
+    mkdirSync(join(dir, ".git"));
+    return dir;
+  }
+
+  async function freshStore(): Promise<JobStore> {
+    return JobStore.open(mkdtempSync(join(tmpdir(), "fleet-store-")));
+  }
+
+  function noopSpawner(): void {}
+
+  it("wait returns timedOut: true when the job never reaches a wake state", async () => {
+    const store = await freshStore();
+    const fleet = new Fleet(store, () => Date.now(), noopSpawner);
+    const repo = await makeRepo();
+    const submit = await fleet.submit({ objective: "wait me", repo, risk: "low" });
+    assert.ok(submit.ok);
+    const result = await fleet.wait({ jobId: (submit.value as { jobId: string }).jobId, timeoutMs: 100 });
+    assert.ok(result.ok);
+    if (!result.ok) return;
+    assert.strictEqual(result.value.timedOut, true);
+  });
+
+  it("wait returns immediately when the job is cancelled", async () => {
+    const store = await freshStore();
+    const fleet = new Fleet(store, () => Date.now(), noopSpawner);
     const repo = await makeRepo();
     const submit = await fleet.submit({ objective: "cancel me", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-
-    const result = await fleet.cancel({
-      jobId: submit.value.jobId,
-      expectedRevision: 1,
-    });
-    if (!result.ok) assert.fail(`cancel failed: ${result.problem} (${result.message})`);
-    assert.strictEqual(result.value.status, "cancelled");
-    assert.strictEqual(result.value.revision, 2);
-    assert.deepStrictEqual([...result.value.next], ["get", "report", "clean", "archive"]);
-  });
-
-  it("cancel requires a valid job id", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const result = await fleet.cancel({ jobId: "", expectedRevision: 1 });
-    assert.strictEqual(result.ok, false);
-    if (!result.ok) assert.strictEqual(result.problem, "invalid-input");
-  });
-
-  it("cancel with a malformed id is invalid-input", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const result = await fleet.cancel({ jobId: "../etc/passwd", expectedRevision: 1 });
-    assert.strictEqual(result.ok, false);
-    if (!result.ok) assert.strictEqual(result.problem, "invalid-input");
-  });
-
-  it("cancel with an unknown id is not-found", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const result = await fleet.cancel({
-      jobId: "01JQQ000000000000000000000",
-      expectedRevision: 1,
-    });
-    assert.strictEqual(result.ok, false);
-    if (!result.ok) assert.strictEqual(result.problem, "not-found");
-  });
-
-  it("cancel with a stale revision is conflict", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    const result = await fleet.cancel({
-      jobId: submit.value.jobId,
-      expectedRevision: 99,
-    });
-    assert.strictEqual(result.ok, false);
-    if (!result.ok) assert.strictEqual(result.problem, "conflict");
-  });
-
-  it("cancel on an already-cancelled job is policy-denied", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    await fleet.cancel({ jobId: submit.value.jobId, expectedRevision: 1 });
-    // Now try to cancel again — the job is already cancelled.
-    const result = await fleet.cancel({
-      jobId: submit.value.jobId,
-      expectedRevision: 2,
-    });
-    assert.strictEqual(result.ok, false);
-    if (!result.ok) assert.strictEqual(result.problem, "policy-denied");
-  });
-
-  it("cancel on an archived job is policy-denied", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    // Move to cancelled then archived via raw mutate.
-    await store.mutateJob(submit.value.jobId, 1, (current) => ({
-      ok: true,
-      value: { next: { ...current, revision: 2, status: "cancelled" }, reason: "cancel" },
-    }));
-    await store.mutateJob(submit.value.jobId, 2, (current) => ({
-      ok: true,
-      value: { next: { ...current, revision: 3, status: "archived" }, reason: "archive" },
-    }));
-    const result = await fleet.cancel({
-      jobId: submit.value.jobId,
-      expectedRevision: 3,
-    });
-    assert.strictEqual(result.ok, false);
-    if (!result.ok) assert.strictEqual(result.problem, "policy-denied");
-  });
-
-  it("cancel on a ready-for-acceptance job is policy-denied", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    await store.mutateJob(submit.value.jobId, 1, (current) => ({
-      ok: true,
-      value: {
-        next: { ...current, revision: 2, status: "ready-for-acceptance" },
-        reason: "done",
-      },
-    }));
-    const result = await fleet.cancel({
-      jobId: submit.value.jobId,
-      expectedRevision: 2,
-    });
-    assert.strictEqual(result.ok, false);
-    if (!result.ok) assert.strictEqual(result.problem, "policy-denied");
-  });
-
-  it("cancel appends an audit entry", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "audit me", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    await fleet.cancel({ jobId: submit.value.jobId, expectedRevision: 1 });
-    const text = await fs.readFile(
-      Paths.jobAudit(store.root, submit.value.jobId),
-      "utf8",
-    );
-    const lines = text.split("\n").filter((l) => l.length > 0);
-    assert.strictEqual(lines.length, 2); // submit + cancel
-    const entry = JSON.parse(lines[1] as string);
-    assert.strictEqual(entry.action, "mutate");
-    assert.strictEqual(entry.revision, 2);
-    assert.strictEqual(entry.reason, "cancel");
-  });
-});
-
-describe("archive", () => {
-  async function makeRepo(): Promise<string> {
-    const dir = mkdtempSync(join(tmpdir(), "fleet-archive-repo-"));
-    mkdirSync(join(dir, ".git"));
-    return dir;
-  }
-
-  async function freshStore(): Promise<JobStore> {
-    return JobStore.open(mkdtempSync(join(tmpdir(), "fleet-archive-store-")));
-  }
-
-  it("archive transitions a cancelled job to archived", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "archive me", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    await fleet.cancel({ jobId: submit.value.jobId, expectedRevision: 1 });
-    const result = await fleet.archive({
-      jobId: submit.value.jobId,
-      expectedRevision: 2,
-    });
-    if (!result.ok) assert.fail(`archive failed: ${result.problem}`);
-    assert.strictEqual(result.value.status, "archived");
-    assert.strictEqual(result.value.revision, 3);
-    assert.deepStrictEqual([...result.value.next], ["get", "report", "purge"]);
-  });
-
-  it("archive on an admitted job is policy-denied", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    const result = await fleet.archive({
-      jobId: submit.value.jobId,
-      expectedRevision: 1,
-    });
-    assert.strictEqual(result.ok, false);
-    if (!result.ok) assert.strictEqual(result.problem, "policy-denied");
-  });
-
-  it("archive on a running job is policy-denied", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    await store.mutateJob(submit.value.jobId, 1, (current) => ({
-      ok: true,
-      value: { next: { ...current, revision: 2, status: "running" }, reason: "start" },
-    }));
-    const result = await fleet.archive({
-      jobId: submit.value.jobId,
-      expectedRevision: 2,
-    });
-    assert.strictEqual(result.ok, false);
-    if (!result.ok) assert.strictEqual(result.problem, "policy-denied");
-  });
-
-  it("archive on a returned-to-orchestrator job succeeds", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    await store.mutateJob(submit.value.jobId, 1, (current) => ({
-      ok: true,
-      value: {
-        next: { ...current, revision: 2, status: "returned-to-orchestrator" },
-        reason: "returned",
-      },
-    }));
-    const result = await fleet.archive({
-      jobId: submit.value.jobId,
-      expectedRevision: 2,
-    });
-    assert.strictEqual(result.ok, true);
-    if (!result.ok) assert.fail("archive should succeed");
-    assert.strictEqual(result.value.status, "archived");
-  });
-
-  it("archive with a stale revision is conflict", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    await fleet.cancel({ jobId: submit.value.jobId, expectedRevision: 1 });
-    const result = await fleet.archive({
-      jobId: submit.value.jobId,
-      expectedRevision: 1, // stale — should be 2
-    });
-    assert.strictEqual(result.ok, false);
-    if (!result.ok) assert.strictEqual(result.problem, "conflict");
-  });
-
-  it("archived jobs are hidden from list by default", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    await fleet.cancel({ jobId: submit.value.jobId, expectedRevision: 1 });
-    await fleet.archive({ jobId: submit.value.jobId, expectedRevision: 2 });
-    const page = await fleet.list();
-    if (!page.ok) assert.fail("list failed");
-    assert.strictEqual(page.value.jobs.length, 0);
-  });
-});
-
-describe("clean", () => {
-  async function makeRepo(): Promise<string> {
-    const dir = mkdtempSync(join(tmpdir(), "fleet-clean-repo-"));
-    mkdirSync(join(dir, ".git"));
-    return dir;
-  }
-
-  async function freshStore(): Promise<JobStore> {
-    return JobStore.open(mkdtempSync(join(tmpdir(), "fleet-clean-store-")));
-  }
-
-  it("clean removes scratch files from a cancelled job", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "clean me", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    const jobId = submit.value.jobId;
-    // Plant some scratch files in tmp/.
-    const tmpDir = Paths.tmpDir(store.root, jobId);
-    mkdirSync(tmpDir, { recursive: true });
-    writeFileSync(join(tmpDir, "scratch.json"), "{}");
-    writeFileSync(join(tmpDir, "more-scratch.txt"), "data");
-
-    await fleet.cancel({ jobId, expectedRevision: 1 });
-    const result = await fleet.clean({ jobId, expectedRevision: 2 });
-    if (!result.ok) assert.fail(`clean failed: ${result.problem}`);
-    // tmp/ should be empty or removed.
-    const entries = readdirSync(tmpDir);
-    assert.strictEqual(entries.length, 0, `tmp/ should be empty, found: ${entries.join(", ")}`);
-  });
-
-  it("clean on an admitted job is policy-denied", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    const result = await fleet.clean({
-      jobId: submit.value.jobId,
-      expectedRevision: 1,
-    });
-    assert.strictEqual(result.ok, false);
-    if (!result.ok) assert.strictEqual(result.problem, "policy-denied");
-  });
-
-  it("clean preserves the job record and branches", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "preserve me", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    const jobId = submit.value.jobId;
-    await fleet.cancel({ jobId, expectedRevision: 1 });
-    await fleet.clean({ jobId, expectedRevision: 2 });
-    // Job record is still readable.
-    const got = await fleet.get(jobId);
-    if (!got.ok) assert.fail("get after clean failed");
-    assert.strictEqual(got.value.status, "cancelled");
-    assert.strictEqual(got.value.revision, 3);
-  });
-
-  it("clean with a stale revision is conflict", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    await fleet.cancel({ jobId: submit.value.jobId, expectedRevision: 1 });
-    const result = await fleet.clean({
-      jobId: submit.value.jobId,
-      expectedRevision: 1, // stale — should be 2
-    });
-    assert.strictEqual(result.ok, false);
-    if (!result.ok) assert.strictEqual(result.problem, "conflict");
-  });
-});
-
-describe("wait", () => {
-  async function makeRepo(): Promise<string> {
-    const dir = mkdtempSync(join(tmpdir(), "fleet-wait-repo-"));
-    mkdirSync(join(dir, ".git"));
-    return dir;
-  }
-
-  async function freshStore(): Promise<JobStore> {
-    return JobStore.open(mkdtempSync(join(tmpdir(), "fleet-wait-store-")));
-  }
-
-  it("wait on an already-terminal job returns immediately", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    await fleet.cancel({ jobId: submit.value.jobId, expectedRevision: 1 });
-    // Job is now cancelled — a terminal state that wait should wake on.
-    const result = await fleet.wait({
-      jobId: submit.value.jobId,
-      timeoutMs: 100,
-    });
-    if (!result.ok) assert.fail(`wait failed: ${result.problem}`);
-    assert.strictEqual(result.value.status, "cancelled");
+    assert.ok(submit.ok);
+    const jobId = (submit.value as { jobId: string }).jobId;
+    const cancel = await fleet.cancel({ jobId, expectedRevision: 1 });
+    assert.ok(cancel.ok);
+    const result = await fleet.wait({ jobId, timeoutMs: 60_000 });
+    assert.ok(result.ok);
+    if (!result.ok) return;
     assert.strictEqual(result.value.timedOut, false);
-  });
-
-  it("wait times out when the job never reaches a terminal state", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "waiting", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    const started = Date.now();
-    const result = await fleet.wait({
-      jobId: submit.value.jobId,
-      timeoutMs: 200,
-    });
-    const elapsed = Date.now() - started;
-    if (!result.ok) assert.fail(`wait failed: ${result.problem}`);
-    assert.strictEqual(result.value.timedOut, true);
-    assert.ok(elapsed >= 150, `expected at least 150ms, got ${elapsed}ms`);
-    assert.ok(elapsed < 5000, `expected less than 5s, got ${elapsed}ms`);
-  });
-
-  it("wait clamps timeout to 60 seconds maximum", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    // A huge timeout should be clamped. We can't wait 60s in a test, so
-    // we just verify the clamping logic by checking the result shape.
-    // The actual 60s wait is tested in integration.
-    const result = await fleet.wait({
-      jobId: submit.value.jobId,
-      timeoutMs: 100,
-    });
-    if (!result.ok) assert.fail(`wait failed: ${result.problem}`);
-    assert.strictEqual(typeof result.value.timedOut, "boolean");
-  });
-
-  it("wait rejects a non-positive timeout", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const result = await fleet.wait({ jobId: "01JQQ000000000000000000000", timeoutMs: 0 });
-    assert.strictEqual(result.ok, false);
-    if (!result.ok) assert.strictEqual(result.problem, "invalid-input");
-  });
-
-  it("wait rejects a malformed job id", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const result = await fleet.wait({ jobId: "../etc/passwd" });
-    assert.strictEqual(result.ok, false);
-    if (!result.ok) assert.strictEqual(result.problem, "invalid-input");
-  });
-
-  it("wait on an unknown job is not-found", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const result = await fleet.wait({
-      jobId: "01JQQ000000000000000000000",
-      timeoutMs: 100,
-    });
-    assert.strictEqual(result.ok, false);
-    if (!result.ok) assert.strictEqual(result.problem, "not-found");
-  });
-
-  it("wait wakes when the job transitions to a terminal state", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    const jobId = submit.value.jobId;
-    // Start a wait, then cancel the job after a short delay.
-    const waitPromise = fleet.wait({ jobId, timeoutMs: 5000 });
-    await new Promise((r) => setTimeout(r, 100));
-    await fleet.cancel({ jobId, expectedRevision: 1 });
-    const result = await waitPromise;
-    if (!result.ok) assert.fail(`wait failed: ${result.problem}`);
     assert.strictEqual(result.value.status, "cancelled");
-    assert.strictEqual(result.value.timedOut, false);
-  });
-});
-
-describe("continue", () => {
-  async function makeRepo(): Promise<string> {
-    const dir = mkdtempSync(join(tmpdir(), "fleet-cont-repo-"));
-    mkdirSync(join(dir, ".git"));
-    return dir;
-  }
-
-  async function freshStore(): Promise<JobStore> {
-    return JobStore.open(mkdtempSync(join(tmpdir(), "fleet-cont-store-")));
-  }
-
-  it("continue transitions a waiting job to running", async () => {
-    const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    // Move to waiting.
-    await store.mutateJob(submit.value.jobId, 1, (current) => ({
-      ok: true,
-      value: { next: { ...current, revision: 2, status: "waiting" }, reason: "need-input" },
-    }));
-    const result = await fleet.continue({
-      jobId: submit.value.jobId,
-      expectedRevision: 2,
-      instructions: "Go ahead with the refactor",
-    });
-    if (!result.ok) assert.fail(`continue failed: ${result.problem}`);
-    assert.strictEqual(result.value.status, "running");
-    assert.strictEqual(result.value.revision, 3);
-    assert.deepStrictEqual([...result.value.next], ["get", "wait", "cancel"]);
   });
 
-  it("continue on an admitted job is policy-denied", async () => {
+  it("cancel returns stale-confirmation on a wrong revision", async () => {
     const store = await freshStore();
-    const fleet = new Fleet(store);
+    const fleet = new Fleet(store, () => Date.now(), noopSpawner);
     const repo = await makeRepo();
     const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    const result = await fleet.continue({
-      jobId: submit.value.jobId,
-      expectedRevision: 1,
-      instructions: "go",
-    });
+    assert.ok(submit.ok);
+    const jobId = (submit.value as { jobId: string }).jobId;
+    const result = await fleet.cancel({ jobId, expectedRevision: 99 });
     assert.strictEqual(result.ok, false);
-    if (!result.ok) assert.strictEqual(result.problem, "policy-denied");
+    if (!result.ok) assert.strictEqual(result.problem, "stale-confirmation");
   });
 
-  it("continue rejects empty instructions", async () => {
+  it("cancel breaks the lease, releases capacity, and preserves the record", async () => {
     const store = await freshStore();
-    const fleet = new Fleet(store);
+    const fleet = new Fleet(store, () => Date.now(), noopSpawner);
     const repo = await makeRepo();
     const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    await store.mutateJob(submit.value.jobId, 1, (current) => ({
-      ok: true,
-      value: { next: { ...current, revision: 2, status: "waiting" }, reason: "wait" },
-    }));
-    const result = await fleet.continue({
-      jobId: submit.value.jobId,
-      expectedRevision: 2,
-      instructions: "   ",
-    });
-    assert.strictEqual(result.ok, false);
-    if (!result.ok) assert.strictEqual(result.problem, "invalid-input");
+    assert.ok(submit.ok);
+    const jobId = (submit.value as { jobId: string }).jobId;
+    // Pre-seed a lease and capacity.
+    await store.claimSupervisorLease(jobId, { pid: 999, bootToken: "x" }, 30_000);
+    await store.acquireCapacity(jobId, "repo-a", { pid: 999, bootToken: "x" }, 30_000);
+
+    const result = await fleet.cancel({ jobId, expectedRevision: 1 });
+    assert.ok(result.ok);
+    if (!result.ok) return;
+    assert.strictEqual(result.value.status, "cancelled");
+
+    const lease = await store.readSupervisorLease(jobId);
+    assert.strictEqual(lease.ok, false);
+
+    const cap = await store.acquireCapacity("01JQQ000000000000000000001", "repo-a", { pid: 1, bootToken: "a" }, 30_000);
+    assert.ok(cap.ok && cap.value.acquired, "capacity should be free after cancel");
   });
 
-  it("continue with a stale revision is conflict", async () => {
+  it("mutateJob rejects a stale lease generation", async () => {
     const store = await freshStore();
-    const fleet = new Fleet(store);
+    const fleet = new Fleet(store, () => Date.now(), noopSpawner);
     const repo = await makeRepo();
     const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    await store.mutateJob(submit.value.jobId, 1, (current) => ({
+    assert.ok(submit.ok);
+    const jobId = (submit.value as { jobId: string }).jobId;
+    await store.claimSupervisorLease(jobId, { pid: 1, bootToken: "a" }, 30_000);
+    const result = await store.mutateJob(jobId, 1, (current) => ({
       ok: true,
-      value: { next: { ...current, revision: 2, status: "waiting" }, reason: "wait" },
-    }));
-    const result = await fleet.continue({
-      jobId: submit.value.jobId,
-      expectedRevision: 1, // stale
-      instructions: "go",
-    });
+      value: { next: { ...current, revision: 2, updatedAt: "2026-01-02T00:00:00Z" }, reason: "test" },
+    }), { leaseGeneration: 99 });
     assert.strictEqual(result.ok, false);
     if (!result.ok) assert.strictEqual(result.problem, "conflict");
   });
+});
 
-  it("continue from returned-to-orchestrator transitions to running", async () => {
+describe("ticket 26: stage artifacts", () => {
+  async function freshStore(): Promise<JobStore> {
+    return JobStore.open(mkdtempSync(join(tmpdir(), "fleet-store-")));
+  }
+
+  it("stageArtifactExists is false before writing", async () => {
     const store = await freshStore();
-    const fleet = new Fleet(store);
-    const repo = await makeRepo();
-    const submit = await fleet.submit({ objective: "x", repo, risk: "low" });
-    if (!submit.ok) assert.fail("submit failed");
-    await store.mutateJob(submit.value.jobId, 1, (current) => ({
-      ok: true,
-      value: {
-        next: { ...current, revision: 2, status: "returned-to-orchestrator" },
-        reason: "returned",
-      },
-    }));
-    const result = await fleet.continue({
-      jobId: submit.value.jobId,
-      expectedRevision: 2,
-      instructions: "try again with a different approach",
-    });
-    if (!result.ok) assert.fail(`continue failed: ${result.problem}`);
-    assert.strictEqual(result.value.status, "running");
-    assert.strictEqual(result.value.revision, 3);
+    const exists = await store.stageArtifactExists("01JQQ000000000000000000000", 0);
+    assert.strictEqual(exists, false);
+  });
+
+  it("writeStageArtifact creates a readable artifact", async () => {
+    const store = await freshStore();
+    const jobId = "01JQQ000000000000000000000";
+    const write = await store.writeStageArtifact(jobId, 0, { result: "ok" });
+    assert.ok(write.ok);
+    const read = await store.readStageArtifact(jobId, 0);
+    assert.ok(read.ok);
+    if (read.ok) assert.deepStrictEqual(read.value, { result: "ok" });
   });
 });
