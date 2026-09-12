@@ -518,10 +518,20 @@ export function sessionName(jobId: string, stageIndex: number, attempt: number):
  * binary with `--version` and reads the first line. A failing probe
  * records `unknown`; the stub binary prints its own version directly so
  * the golden fixture names the version it came from.
+ *
+ * A `.ts` path is run via `node --experimental-strip-types`, mirroring
+ * the spawn behaviour of `runStage`. A real binary path is spawned
+ * directly.
  */
 export async function probePiVersion(piBinary: string): Promise<string> {
   return new Promise((resolve) => {
-    const child = spawn(piBinary, ["--version"], { stdio: ["ignore", "pipe", "pipe"] });
+    const spawnArgv: string[] = [];
+    let spawnCommand = piBinary;
+    if (piBinary.endsWith(".ts")) {
+      spawnCommand = process.execPath;
+      spawnArgv.push("--experimental-strip-types", piBinary);
+    }
+    const child = spawn(spawnCommand, [...spawnArgv, "--version"], { stdio: ["ignore", "pipe", "pipe"] });
     let out = "";
     child.stdout.on("data", (chunk: Buffer) => {
       out += chunk.toString("utf8");
@@ -799,6 +809,16 @@ export async function runStage(opts: RunStageOptions): Promise<RunResult> {
     stdio: ["pipe", "pipe", "pipe"],
   });
 
+  // A spawn that fails before any output is an infrastructure failure:
+  // the binary path is wrong, the binary is not executable, or some
+  // resource is missing. We classify it as such and bail out so the
+  // supervisor never sees an unhandled exception. The call intent has
+  // already been written — durable evidence of the attempt.
+  let spawnError: Error | null = null;
+  child.once("error", (err: Error) => {
+    spawnError = err;
+  });
+
   // 3. Consume the event stream with LF-only framing.
   const collected: PiEvent[] = [];
   const parseState: { buffer: string } = { buffer: "" };
@@ -872,6 +892,21 @@ export async function runStage(opts: RunStageOptions): Promise<RunResult> {
 
   const launched = await launchPromise;
   if (launchTimer !== null) clearTimeout(launchTimer);
+  if (spawnError !== null) {
+    // Spawn failed. The child never produced output; the call intent
+    // is already on disk. This is infrastructure: the binary path was
+    // bad or the host could not exec it.
+    if (eventsFile !== null) await eventsFile.close().catch(() => {});
+    return {
+      inputProblem: null,
+      outcome: { kind: "infra", reason: `spawn failed: ${spawnError.message}`, summary: summarise(collected), events: collected },
+      terminateRung: "none",
+      sessionFile: null,
+      sessionBytes: 0,
+      callIntentPath,
+      piVersion,
+    };
+  }
   if (!agentStartSeen && launched === "timeout") {
     // No agent_start within launchTimeoutMs. This is an infrastructure
     // failure: classify and stop. The ladder still runs to record the rung.
@@ -944,6 +979,12 @@ export async function runStage(opts: RunStageOptions): Promise<RunResult> {
   const summary = summarise(collected);
   const validated = summary.sealed !== null ? validateSubmitPayload(summary.sealed) : null;
   if (summary.sealed !== null && validated !== null && validated.ok && summary.sealedTool !== null) {
+    // The stage sealed: scrub the session file in place. The spec says
+    // "scrubbed at seal and at egress"; this is the seal step. Egress
+    // scrubbing is the consumer's job (the supervisor / a report).
+    if (sessionFile !== null) {
+      await scrubSessionFile(sessionFile);
+    }
     return {
       inputProblem: null,
       outcome: { kind: "sealed", tool: summary.sealedTool, payload: summary.sealed, summary, events: collected },

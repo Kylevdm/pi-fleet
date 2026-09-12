@@ -637,42 +637,87 @@ describe("driver — supporting helpers", () => {
 // ---------------------------------------------------------------------------
 
 describe("driver — end-to-end against the stub binary", () => {
-  it("runStage against the existing stub seals and returns the schema-valid payload", async () => {
+  it("runStage against the fixture-replaying stub seals and scrubs the session file", async () => {
     const dir = freshTmp("fleet-r1-e2e-");
     const stageDir = join(dir, "stage");
     const sessionDir = join(stageDir, "session");
     const artifactPath = join(stageDir, "artifact.json");
 
-    // The current stub writes a fixed payload; the driver must validate it
-    // and report sealed.
     const result = await runStage({
       jobId: "01JQQ000000000000000000000",
       stageIndex: 0,
       attempt: 1,
-      piBinary: process.execPath,
+      piBinary: STUB_PATH,
       artifactPath,
       stageDir,
       sessionDir,
       launchTimeoutMs: 5_000,
       stageTimeoutMs: 30_000,
-      // Override argv: the current stub uses --artifact and --delay, the
-      // new driver uses --artifact. We pass the stub path explicitly.
-      // (The driver invokes `piBinary` with a fixed argv; for the stub we
-      // rely on its `--artifact` flag matching our path.)
     });
-    // The current stub writes a minimal artifact whose schema is
-    // "stage-artifact/1" with a `tool: submit_write` and a `result`
-    // object — the new driver's validateSubmitPayload will reject it
-    // because `summary`/`filesTouched`/`commandsRun`/`contractMet` are
-    // not at the top level. That is correct: the stub predates ticket 25
-    // and the existing stub does not implement the full extension
-    // contract. Ticket 25 replaces the stub with a fixture-replaying one
-    // that emits a schema-valid submit_* before exit. Until then we
-    // expect a quality failure whose reason names what is missing.
-    assert.strictEqual(result.callIntentPath.length > 0, true, "call-intent was written");
-    assert.strictEqual(existsSync(result.callIntentPath), true);
-    // piVersion is recorded (the stub prints a version).
-    assert.strictEqual(typeof result.piVersion, "string");
+
+    // The call intent is written before spawn and is readable after.
+    assert.strictEqual(existsSync(result.callIntentPath), true, "call-intent was written");
+    const intent = JSON.parse(readFileSync(result.callIntentPath, "utf8")) as Record<string, unknown>;
+    assert.strictEqual(intent.schema, "call-intent/1");
+    assert.strictEqual(intent.jobId, "01JQQ000000000000000000000");
+    assert.strictEqual(intent.stageIndex, 0);
+    assert.strictEqual(intent.attempt, 1);
+    assert.strictEqual(intent.piBinary, STUB_PATH);
+    assert.strictEqual(intent.piVersion, "minimax-m3-fixture@1");
+    assert.strictEqual(intent.sessionName, "01JQQ000000000000000000000-0-1");
+
+    // The stub replays the fixture, which ends in a schema-valid
+    // submit_write tool_execution_end, so the stage seals.
+    assert.strictEqual(result.outcome.kind, "sealed");
+    if (result.outcome.kind === "sealed") {
+      assert.strictEqual(result.outcome.tool, "submit_write");
+      const payload = result.outcome.payload as Record<string, unknown>;
+      assert.strictEqual(typeof payload.summary, "string");
+      assert.ok((payload.filesTouched as string[]).length > 0);
+      assert.strictEqual(payload.contractMet, true);
+    }
+
+    // Usage sums to the regression fixture's totals (1,000 + 4,970 = 5,970
+    // input, 20,000 + 21,503 = 41,503 output).
+    if (result.outcome.kind === "sealed") {
+      const usage = result.outcome.summary.usage;
+      assert.strictEqual(usage.input, 5_970);
+      assert.strictEqual(usage.output, 41_503);
+      assert.strictEqual(usage.totalTokens, 47_473);
+    }
+
+    // The session file is retained inside the stage directory.
+    assert.ok(result.sessionFile !== null);
+    assert.ok(result.sessionFile!.includes(sessionDir));
+
+    // The stub wrote credentials into the session JSON. The driver
+    // scrubs them at seal.
+    const sessionText = readFileSync(result.sessionFile!, "utf8");
+    assert.ok(!sessionText.includes("sk-fixture-secret"), "apiKey was redacted");
+    assert.ok(!sessionText.includes("bearer-fixture-token"), "token was redacted");
+    assert.ok(sessionText.includes("[REDACTED]"));
+  });
+
+  it("runStage persists call intent before spawn even when the binary later fails", async () => {
+    const dir = freshTmp("fleet-r1-intent-");
+    const stageDir = join(dir, "stage");
+    const sessionDir = join(stageDir, "session");
+    const artifactPath = join(stageDir, "artifact.json");
+    const nonExistent = join(dir, "no-such-binary");
+
+    const result = await runStage({
+      jobId: "01JQQ000000000000000000000",
+      stageIndex: 0,
+      attempt: 1,
+      piBinary: nonExistent,
+      artifactPath,
+      stageDir,
+      sessionDir,
+      launchTimeoutMs: 1_000,
+      stageTimeoutMs: 2_000,
+    });
+
+    assert.strictEqual(existsSync(result.callIntentPath), true, "call-intent is durable across a failed spawn");
   });
 });
 

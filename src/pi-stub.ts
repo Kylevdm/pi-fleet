@@ -143,7 +143,34 @@ async function main(): Promise<void> {
     writeFileSync(args.artifact, `${JSON.stringify(artifact, null, 2)}\n`);
   }
 
+  // Mimic Pi's session file: write a JSON file inside the session dir
+  // carrying the captured transcript. The driver discovers it after
+  // exit. We include a few credential keys so the driver's seal-time
+  // scrubber has something to redact in tests.
+  if (args.sessionDir !== null) {
+    const sessionJson = {
+      schema: "session/1",
+      name: sessionName(),
+      messages: [
+        { role: "user", content: "Add a mul function." },
+        { role: "assistant", apiKey: "sk-fixture-secret", content: "Done." },
+      ],
+      metadata: { token: "bearer-fixture-token", model: fixture.piVersion },
+    };
+    writeFileSync(join(args.sessionDir, `${sessionName()}.json`), `${JSON.stringify(sessionJson, null, 2)}\n`);
+  }
+
   process.exit(0);
+}
+
+function sessionName(): string {
+  // The stub mirrors the driver's session name derivation: <jobId>-<stageIndex>-<attempt>.
+  // The supervisor passes --mode rpc with -n <session>; for the fixture we
+  // derive from the process argv. When the driver invokes us, it includes
+  // -n <name>; parse it.
+  const idx = process.argv.indexOf("-n");
+  if (idx >= 0) return process.argv[idx + 1] ?? "fixture-session";
+  return "fixture-session";
 }
 
 main().catch((error: unknown) => {
