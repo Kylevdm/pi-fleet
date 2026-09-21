@@ -8,9 +8,9 @@ Labels used below:
 - **Inference**: an architectural conclusion drawn from documented behavior.
 - **Prototype**: behavior that the documentation does not settle and must be tested with the intended account and CLI version.
 
-## Decision
+## Research conclusion
 
-Fleet should use one runner contract with provider-specific execution adapters:
+The evidence supports one runner contract with provider-specific execution adapters as an option for the later **Choose the execution-backend boundary** ticket. This is a research conclusion, not a settled Wayfinder architecture decision. That later ticket should evaluate:
 
 - **Codex:** use the official Codex SDK, backed by `codex exec` and ChatGPT subscription login. This is the clearest supported path to model selection, sandbox controls, resumable threads, structured output, cancellation, and machine-readable usage.
 - **Claude:** use native Claude Code in print mode with Claude Pro/Max login. Do not use `--bare`: Anthropic documents that bare mode does not use subscription login. Use safe mode plus an explicit tool and permission policy for unattended runs.
