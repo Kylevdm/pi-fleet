@@ -430,9 +430,19 @@ export async function terminate(
   return "sigkill";
 }
 
+/**
+ * Has this child already gone? `exitCode` alone does not answer it: a child
+ * killed by a signal exits with `exitCode === null` and `signalCode` set, so
+ * reading only `exitCode` reports a dead process as running — and its `exit`
+ * event has already fired and will never fire again.
+ */
+function hasExited(child: ChildProcess): boolean {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
 function waitForExit(child: ChildProcess, timeoutMs: number): Promise<boolean> {
   return new Promise((resolve) => {
-    if (child.exitCode !== null) {
+    if (hasExited(child)) {
       resolve(true);
       return;
     }
@@ -999,8 +1009,7 @@ export async function runStage(opts: RunStageOptions): Promise<RunResult> {
     // "still running": a signal-killed child leaves `exitCode` null and sets
     // `signalCode`, and its `exit` event has already fired and will not fire
     // again.
-    const stillRunning = child.exitCode === null && child.signalCode === null;
-    if (stillRunning || child.stdout?.readableEnded === false) {
+    if (!hasExited(child) || child.stdout?.readableEnded === false) {
       await new Promise<void>((resolve) => {
         const t = setTimeout(resolve, 5_000);
         child.once("close", () => {

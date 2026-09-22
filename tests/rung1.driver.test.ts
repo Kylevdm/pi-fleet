@@ -523,6 +523,34 @@ describe("driver (6) — termination ladder records its rung", () => {
     const rung = await terminate(child, { sigtermToSigkillMs: 500 });
     assert.strictEqual(rung, "none");
   });
+
+  it("none rung: a child already dead by signal is recognised, not walked down the ladder", async () => {
+    // A child killed by a signal leaves exitCode null and sets signalCode.
+    // Reading "exitCode === null" as "still running" means every rung waits
+    // for an `exit` event that has already fired and will never fire again:
+    // 50ms + 10s abort + 30s SIGTERM + 5s, then a "sigkill" verdict on a
+    // process nothing in this ladder killed. Reachable from runStage's
+    // launch-timeout path whenever Pi is OOM-killed or segfaults at start.
+    const dir = freshTmp("fleet-r1-signalled-");
+    const script = join(dir, "spin.mjs");
+    writeFileSync(script, "process.stdin.on('data', () => {});\nsetInterval(() => {}, 1000);\n");
+    const child = spawn(process.execPath, [script], { stdio: ["pipe", "pipe", "pipe"] });
+
+    // Kill it out from under the ladder and wait until Node has reaped it.
+    await new Promise<void>((resolve) => {
+      child.once("exit", () => resolve());
+      child.kill("SIGKILL");
+    });
+    assert.strictEqual(child.exitCode, null, "a signalled child has no exit code");
+    assert.strictEqual(child.signalCode, "SIGKILL", "it has a signal code instead");
+
+    const started = Date.now();
+    const rung = await terminate(child, { sigtermToSigkillMs: 30_000 });
+    const elapsed = Date.now() - started;
+
+    assert.strictEqual(rung, "none", "the ladder did not end this process");
+    assert.ok(elapsed < 1_000, `returns promptly; took ${elapsed}ms`);
+  });
 });
 
 // ---------------------------------------------------------------------------
