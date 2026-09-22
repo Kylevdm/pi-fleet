@@ -26,6 +26,7 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import * as fs from "node:fs/promises";
 import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { isValidUlid } from "./ulid.ts";
 import type { Problem } from "./envelope.ts";
 
@@ -695,6 +696,13 @@ export interface RunStageOptions {
   model?: string;
   /** Optional tool allowlist forwarded as `--tools`. */
   tools?: readonly string[];
+  /**
+   * Fleet extension forwarded as `-e`. Defaults to the `fleet-extension.ts`
+   * shipped beside this module. The extension is what registers the
+   * `submit_*` tools, so without it no stage can seal — the allowlist in
+   * `tools` names tools that would otherwise not exist.
+   */
+  extensionPath?: string;
   /** Launch timeout (ms) to first `agent_start`. Spec: 90_000. */
   launchTimeoutMs?: number;
   /** Wall-clock cap for the entire stage attempt. */
@@ -744,6 +752,14 @@ const DEFAULT_STAGE_TIMEOUT_MS = 60 * 60 * 1000; // one hour; stage-specific cap
  * The returned outcome is a discriminated union so the supervisor can act
  * on each class without re-parsing.
  */
+/**
+ * The Fleet extension ships beside this module. Resolved at call time so a
+ * test can point `extensionPath` elsewhere without touching the default.
+ */
+export function defaultExtensionPath(): string {
+  return join(dirname(fileURLToPath(import.meta.url)), "fleet-extension.ts");
+}
+
 export async function runStage(opts: RunStageOptions): Promise<RunResult> {
   if (!isValidUlid(opts.jobId)) {
     return {
@@ -787,11 +803,16 @@ export async function runStage(opts: RunStageOptions): Promise<RunResult> {
     spawnCommand = process.execPath;
     spawnArgv.push("--experimental-strip-types", opts.piBinary);
   }
+  // The extension registers the terminating `submit_*` tools. It must be
+  // loaded or the allowlist below names tools Pi has never heard of, and no
+  // stage can seal.
+  const extensionPath = opts.extensionPath ?? defaultExtensionPath();
   const argv: string[] = [
     ...spawnArgv,
     "--mode", "rpc",
     "--session-dir", opts.sessionDir,
     "-n", session,
+    "-e", extensionPath,
   ];
   if (typeof opts.model === "string" && opts.model.length > 0) {
     argv.push("--model", opts.model);
@@ -855,6 +876,22 @@ export async function runStage(opts: RunStageOptions): Promise<RunResult> {
   };
 
   child.stdout?.on("data", onChunk);
+  // A final line without a trailing newline is still an event. Flush what is
+  // left in the framing buffer once stdout ends.
+  child.stdout?.once("end", () => {
+    const tail = parseState.buffer;
+    parseState.buffer = "";
+    const line = tail.endsWith("\r") ? tail.slice(0, -1) : tail;
+    if (line.length === 0) return;
+    const ev = parseEvent(line);
+    if (ev === null) return;
+    collected.push(ev);
+    if (eventsFile !== null) {
+      eventsFile.write(`${JSON.stringify(ev)}\n`).catch(() => {});
+    }
+    if (ev.type === "agent_start") agentStartSeen = true;
+    if (ev.type === "agent_settled") settled = true;
+  });
   // stderr is captured for diagnostics but not parsed.
   child.stderr?.setEncoding("utf8");
 
@@ -886,8 +923,11 @@ export async function runStage(opts: RunStageOptions): Promise<RunResult> {
       }
     }, 50);
     launchInterval = poll;
-    // Watch for an early exit.
-    child.once("exit", () => {
+    // Watch for an early exit. `close` rather than `exit`: `exit` fires when
+    // the child is reaped, which can be before its stdout has been drained,
+    // so an `agent_start` still sitting in the pipe would read as a launch
+    // timeout.
+    child.once("close", () => {
       clearInterval(poll);
       resolve(agentStartSeen ? "launched" : "timeout");
     });
@@ -902,7 +942,11 @@ export async function runStage(opts: RunStageOptions): Promise<RunResult> {
       }
     }, 50);
     stageInterval = poll;
-    child.once("exit", () => {
+    // Same reason as the launch wait, and it matters more here: the sealing
+    // `tool_execution_end` and `agent_settled` are the last things Pi writes,
+    // so classifying at `exit` drops exactly the events that decide whether a
+    // paid stage sealed.
+    child.once("close", () => {
       clearInterval(poll);
       resolve("exit");
     });
@@ -950,11 +994,16 @@ export async function runStage(opts: RunStageOptions): Promise<RunResult> {
 
     if (eventsFile !== null) await eventsFile.close().catch(() => {});
 
-    // Wait for the child to fully exit (it may still be flushing).
-    if (child.exitCode === null) {
+    // Wait for the child to fully exit *and* for its pipes to close, so the
+    // classification below sees every event. `exitCode === null` alone is not
+    // "still running": a signal-killed child leaves `exitCode` null and sets
+    // `signalCode`, and its `exit` event has already fired and will not fire
+    // again.
+    const stillRunning = child.exitCode === null && child.signalCode === null;
+    if (stillRunning || child.stdout?.readableEnded === false) {
       await new Promise<void>((resolve) => {
         const t = setTimeout(resolve, 5_000);
-        child.once("exit", () => {
+        child.once("close", () => {
           clearTimeout(t);
           resolve();
         });

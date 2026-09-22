@@ -721,6 +721,146 @@ describe("driver — end-to-end against the stub binary", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Regressions found by the review beat on ticket 25.
+// ---------------------------------------------------------------------------
+
+/**
+ * Writes a fake Pi binary that records its own argv, floods stdout with a
+ * burst big enough to outlast the pipe buffer, then emits the sealing
+ * events and exits immediately. The burst is the point: a driver that
+ * stops reading at `exit` rather than at stdout close will still have the
+ * tail sitting unread in the pipe.
+ */
+function writeBurstPi(dir: string, burstLines: number): string {
+  const path = join(dir, "burst-pi.ts");
+  writeFileSync(
+    path,
+    `
+import { writeFileSync, mkdirSync, writeSync } from "node:fs";
+import { join } from "node:path";
+
+const argv = process.argv.slice(2);
+const idx = (flag: string): string | null => {
+  const i = argv.indexOf(flag);
+  return i >= 0 ? (argv[i + 1] ?? null) : null;
+};
+const sessionDir = idx("--session-dir");
+const name = idx("-n") ?? "fixture-session";
+if (sessionDir !== null) mkdirSync(sessionDir, { recursive: true });
+writeFileSync(join(${JSON.stringify(dir)}, "argv.json"), JSON.stringify(argv));
+
+// writeSync, not process.stdout.write: an async write followed by
+// process.exit drops whatever is still buffered, which would make this a
+// test of the fixture's truncation rather than of the driver's draining.
+const emit = (o: unknown): void => { writeSync(1, JSON.stringify(o) + "\\n"); };
+emit({ type: "agent_start" });
+for (let i = 0; i < ${burstLines}; i += 1) {
+  emit({ type: "message_end", message: { role: "assistant", content: "x".repeat(200) } });
+}
+emit({
+  type: "tool_execution_end",
+  toolName: "submit_write",
+  result: { isError: false, details: { summary: "burst", filesTouched: ["a.ts"], commandsRun: ["npm t"], contractMet: true } },
+});
+// Deliberately no trailing newline on the last event: Pi's stream ends
+// where it ends, and a framing buffer that only splits on "\\n" drops it.
+writeSync(1, JSON.stringify({ type: "agent_settled" }));
+if (sessionDir !== null) {
+  writeFileSync(join(sessionDir, name + ".json"), JSON.stringify({ schema: "session/1", name }));
+}
+`,
+    "utf8",
+  );
+  return path;
+}
+
+describe("driver — stdout is drained before the stage is classified", () => {
+  it("reads a final event that arrives without a trailing newline", async () => {
+    const dir = freshTmp("fleet-r1-drain-");
+    const stageDir = join(dir, "stage");
+    const sessionDir = join(stageDir, "session");
+    const piBinary = writeBurstPi(dir, 5_000);
+
+    const result = await runStage({
+      jobId: "01JQQ000000000000000000000",
+      stageIndex: 0,
+      attempt: 1,
+      piBinary,
+      artifactPath: join(stageDir, "artifact.json"),
+      stageDir,
+      sessionDir,
+      launchTimeoutMs: 10_000,
+      stageTimeoutMs: 30_000,
+    });
+
+    // The sealing events are the last thing on a ~1MB stream. Resolving the
+    // stage wait on `exit` loses them and misreports a paid, sealed stage as
+    // a quality failure worth re-running.
+    assert.strictEqual(
+      result.outcome.kind,
+      "sealed",
+      `expected the trailing events to be read; got ${result.outcome.kind}: ${"reason" in result.outcome ? result.outcome.reason : ""}`,
+    );
+    assert.strictEqual(result.outcome.summary.settled, true, "agent_settled was read");
+    assert.ok(result.outcome.events.length >= 5_003, `all events read, got ${result.outcome.events.length}`);
+  });
+});
+
+describe("driver — the Fleet extension is loaded into Pi", () => {
+  it("passes -e <extension> so the submit_* tools exist", async () => {
+    const dir = freshTmp("fleet-r1-ext-");
+    const stageDir = join(dir, "stage");
+    const sessionDir = join(stageDir, "session");
+    const piBinary = writeBurstPi(dir, 1);
+
+    await runStage({
+      jobId: "01JQQ000000000000000000000",
+      stageIndex: 0,
+      attempt: 1,
+      piBinary,
+      artifactPath: join(stageDir, "artifact.json"),
+      stageDir,
+      sessionDir,
+      launchTimeoutMs: 10_000,
+      stageTimeoutMs: 30_000,
+      tools: ["read", "submit_write"],
+    });
+
+    const argv = JSON.parse(readFileSync(join(dir, "argv.json"), "utf8")) as string[];
+    const eIdx = argv.indexOf("-e");
+    assert.ok(eIdx >= 0, `argv carries -e; got ${argv.join(" ")}`);
+    const extPath = argv[eIdx + 1] ?? "";
+    assert.ok(extPath.endsWith("fleet-extension.ts"), `-e points at the extension; got ${extPath}`);
+    assert.strictEqual(existsSync(extPath), true, "the extension path exists on disk");
+  });
+
+  it("honours an explicit extensionPath override", async () => {
+    const dir = freshTmp("fleet-r1-ext2-");
+    const stageDir = join(dir, "stage");
+    const sessionDir = join(stageDir, "session");
+    const piBinary = writeBurstPi(dir, 1);
+    const custom = join(dir, "custom-extension.ts");
+    writeFileSync(custom, "export default function (): void {}\n", "utf8");
+
+    await runStage({
+      jobId: "01JQQ000000000000000000000",
+      stageIndex: 0,
+      attempt: 1,
+      piBinary,
+      artifactPath: join(stageDir, "artifact.json"),
+      stageDir,
+      sessionDir,
+      launchTimeoutMs: 10_000,
+      stageTimeoutMs: 30_000,
+      extensionPath: custom,
+    });
+
+    const argv = JSON.parse(readFileSync(join(dir, "argv.json"), "utf8")) as string[];
+    assert.strictEqual(argv[argv.indexOf("-e") + 1], custom);
+  });
+});
+
 // Silence unused warning on imports kept for cross-reference.
 void spawnStub;
 void buildEventStreamFixture;

@@ -20,7 +20,7 @@
  * setting `--delay` to a value larger than the launch window.
  */
 
-import { writeFileSync, mkdirSync, readFileSync } from "node:fs";
+import { writeFileSync, mkdirSync, readFileSync, writeSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -74,7 +74,10 @@ function loadFixture(): ParsedFixture {
 }
 
 function emit(event: unknown): void {
-  console.log(JSON.stringify(event));
+  // writeSync, not console.log: stdout to a pipe is async, and the
+  // `process.exit(0)` at the end of main discards whatever is still
+  // buffered — which is exactly the sealing events, since they are last.
+  writeSync(1, `${JSON.stringify(event)}\n`);
 }
 
 function sleep(ms: number): Promise<void> {
