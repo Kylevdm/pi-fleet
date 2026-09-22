@@ -1,0 +1,594 @@
+[
+  {
+    "marks": {
+      "spawned": 3.283488,
+      "initSent": 3.810172,
+      "initialized": 233.286734,
+      "probeSent": 233.388835,
+      "probeAnswered": 830.811509,
+      "exited": 859.546946
+    },
+    "result": {
+      "ordinaryUsageAllowed": true,
+      "rateLimits": {
+        "limitId": "codex",
+        "limitName": null,
+        "normalModelSlug": null,
+        "primary": {
+          "usedPercent": 0,
+          "windowDurationMins": 300,
+          "resetsAt": 1790088500
+        },
+        "secondary": {
+          "usedPercent": 13,
+          "windowDurationMins": 10080,
+          "resetsAt": 1790586920
+        },
+        "credits": {
+          "hasCredits": false,
+          "unlimited": false,
+          "balance": "0"
+        },
+        "individualLimit": null,
+        "spendControlReached": false,
+        "planType": "plus",
+        "rateLimitReachedType": null
+      },
+      "rateLimitsByLimitId": {
+        "codex": {
+          "limitId": "codex",
+          "limitName": null,
+          "normalModelSlug": null,
+          "primary": {
+            "usedPercent": 0,
+            "windowDurationMins": 300,
+            "resetsAt": 1790088500
+          },
+          "secondary": {
+            "usedPercent": 13,
+            "windowDurationMins": 10080,
+            "resetsAt": 1790586920
+          },
+          "credits": {
+            "hasCredits": false,
+            "unlimited": false,
+            "balance": "0"
+          },
+          "individualLimit": null,
+          "spendControlReached": false,
+          "planType": "plus",
+          "rateLimitReachedType": null
+        }
+      },
+      "rateLimitResetCredits": {
+        "availableCount": 0,
+        "credits": []
+      },
+      "accountId": "3ebc88b8-4aff-4245-a1b4-0a457f23c962",
+      "rateLimitUpsell": null
+    },
+    "err": null,
+    "code": 0,
+    "signal": null,
+    "stderr": "",
+    "pid": 2687531
+  },
+  {
+    "marks": {
+      "spawned": 1.654685,
+      "initSent": 1.710465,
+      "initialized": 206.897008,
+      "probeSent": 207.07568,
+      "probeAnswered": 895.870116,
+      "exited": 930.880428
+    },
+    "result": {
+      "ordinaryUsageAllowed": true,
+      "rateLimits": {
+        "limitId": "codex",
+        "limitName": null,
+        "normalModelSlug": null,
+        "primary": {
+          "usedPercent": 0,
+          "windowDurationMins": 300,
+          "resetsAt": 1790088500
+        },
+        "secondary": {
+          "usedPercent": 13,
+          "windowDurationMins": 10080,
+          "resetsAt": 1790586920
+        },
+        "credits": {
+          "hasCredits": false,
+          "unlimited": false,
+          "balance": "0"
+        },
+        "individualLimit": null,
+        "spendControlReached": false,
+        "planType": "plus",
+        "rateLimitReachedType": null
+      },
+      "rateLimitsByLimitId": {
+        "codex": {
+          "limitId": "codex",
+          "limitName": null,
+          "normalModelSlug": null,
+          "primary": {
+            "usedPercent": 0,
+            "windowDurationMins": 300,
+            "resetsAt": 1790088500
+          },
+          "secondary": {
+            "usedPercent": 13,
+            "windowDurationMins": 10080,
+            "resetsAt": 1790586920
+          },
+          "credits": {
+            "hasCredits": false,
+            "unlimited": false,
+            "balance": "0"
+          },
+          "individualLimit": null,
+          "spendControlReached": false,
+          "planType": "plus",
+          "rateLimitReachedType": null
+        }
+      },
+      "rateLimitResetCredits": {
+        "availableCount": 0,
+        "credits": []
+      },
+      "accountId": "3ebc88b8-4aff-4245-a1b4-0a457f23c962",
+      "rateLimitUpsell": null
+    },
+    "err": null,
+    "code": 0,
+    "signal": null,
+    "stderr": "",
+    "pid": 2687750
+  },
+  {
+    "marks": {
+      "spawned": 1.650814,
+      "initSent": 1.698724,
+      "initialized": 206.430503,
+      "probeSent": 206.738106,
+      "probeAnswered": 797.103268,
+      "exited": 822.92354
+    },
+    "result": {
+      "ordinaryUsageAllowed": true,
+      "rateLimits": {
+        "limitId": "codex",
+        "limitName": null,
+        "normalModelSlug": null,
+        "primary": {
+          "usedPercent": 0,
+          "windowDurationMins": 300,
+          "resetsAt": 1790088500
+        },
+        "secondary": {
+          "usedPercent": 13,
+          "windowDurationMins": 10080,
+          "resetsAt": 1790586920
+        },
+        "credits": {
+          "hasCredits": false,
+          "unlimited": false,
+          "balance": "0"
+        },
+        "individualLimit": null,
+        "spendControlReached": false,
+        "planType": "plus",
+        "rateLimitReachedType": null
+      },
+      "rateLimitsByLimitId": {
+        "codex": {
+          "limitId": "codex",
+          "limitName": null,
+          "normalModelSlug": null,
+          "primary": {
+            "usedPercent": 0,
+            "windowDurationMins": 300,
+            "resetsAt": 1790088500
+          },
+          "secondary": {
+            "usedPercent": 13,
+            "windowDurationMins": 10080,
+            "resetsAt": 1790586920
+          },
+          "credits": {
+            "hasCredits": false,
+            "unlimited": false,
+            "balance": "0"
+          },
+          "individualLimit": null,
+          "spendControlReached": false,
+          "planType": "plus",
+          "rateLimitReachedType": null
+        }
+      },
+      "rateLimitResetCredits": {
+        "availableCount": 0,
+        "credits": []
+      },
+      "accountId": "3ebc88b8-4aff-4245-a1b4-0a457f23c962",
+      "rateLimitUpsell": null
+    },
+    "err": null,
+    "code": 0,
+    "signal": null,
+    "stderr": "",
+    "pid": 2688017
+  },
+  {
+    "marks": {
+      "spawned": 1.481753,
+      "initSent": 1.605094,
+      "initialized": 205.831588,
+      "probeSent": 205.928959,
+      "probeAnswered": 842.772459,
+      "exited": 869.108135
+    },
+    "result": {
+      "ordinaryUsageAllowed": true,
+      "rateLimits": {
+        "limitId": "codex",
+        "limitName": null,
+        "normalModelSlug": null,
+        "primary": {
+          "usedPercent": 0,
+          "windowDurationMins": 300,
+          "resetsAt": 1790088500
+        },
+        "secondary": {
+          "usedPercent": 13,
+          "windowDurationMins": 10080,
+          "resetsAt": 1790586920
+        },
+        "credits": {
+          "hasCredits": false,
+          "unlimited": false,
+          "balance": "0"
+        },
+        "individualLimit": null,
+        "spendControlReached": false,
+        "planType": "plus",
+        "rateLimitReachedType": null
+      },
+      "rateLimitsByLimitId": {
+        "codex": {
+          "limitId": "codex",
+          "limitName": null,
+          "normalModelSlug": null,
+          "primary": {
+            "usedPercent": 0,
+            "windowDurationMins": 300,
+            "resetsAt": 1790088500
+          },
+          "secondary": {
+            "usedPercent": 13,
+            "windowDurationMins": 10080,
+            "resetsAt": 1790586920
+          },
+          "credits": {
+            "hasCredits": false,
+            "unlimited": false,
+            "balance": "0"
+          },
+          "individualLimit": null,
+          "spendControlReached": false,
+          "planType": "plus",
+          "rateLimitReachedType": null
+        }
+      },
+      "rateLimitResetCredits": {
+        "availableCount": 0,
+        "credits": []
+      },
+      "accountId": "3ebc88b8-4aff-4245-a1b4-0a457f23c962",
+      "rateLimitUpsell": null
+    },
+    "err": null,
+    "code": 0,
+    "signal": null,
+    "stderr": "",
+    "pid": 2688236
+  },
+  {
+    "marks": {
+      "spawned": 1.468394,
+      "initSent": 1.599385,
+      "initialized": 208.140448,
+      "probeSent": 208.198869,
+      "probeAnswered": 832.778762,
+      "exited": 865.273471
+    },
+    "result": {
+      "ordinaryUsageAllowed": true,
+      "rateLimits": {
+        "limitId": "codex",
+        "limitName": null,
+        "normalModelSlug": null,
+        "primary": {
+          "usedPercent": 0,
+          "windowDurationMins": 300,
+          "resetsAt": 1790088500
+        },
+        "secondary": {
+          "usedPercent": 13,
+          "windowDurationMins": 10080,
+          "resetsAt": 1790586920
+        },
+        "credits": {
+          "hasCredits": false,
+          "unlimited": false,
+          "balance": "0"
+        },
+        "individualLimit": null,
+        "spendControlReached": false,
+        "planType": "plus",
+        "rateLimitReachedType": null
+      },
+      "rateLimitsByLimitId": {
+        "codex": {
+          "limitId": "codex",
+          "limitName": null,
+          "normalModelSlug": null,
+          "primary": {
+            "usedPercent": 0,
+            "windowDurationMins": 300,
+            "resetsAt": 1790088500
+          },
+          "secondary": {
+            "usedPercent": 13,
+            "windowDurationMins": 10080,
+            "resetsAt": 1790586920
+          },
+          "credits": {
+            "hasCredits": false,
+            "unlimited": false,
+            "balance": "0"
+          },
+          "individualLimit": null,
+          "spendControlReached": false,
+          "planType": "plus",
+          "rateLimitReachedType": null
+        }
+      },
+      "rateLimitResetCredits": {
+        "availableCount": 0,
+        "credits": []
+      },
+      "accountId": "3ebc88b8-4aff-4245-a1b4-0a457f23c962",
+      "rateLimitUpsell": null
+    },
+    "err": null,
+    "code": 0,
+    "signal": null,
+    "stderr": "",
+    "pid": 2688521
+  },
+  {
+    "marks": {
+      "spawned": 1.407082,
+      "initSent": 1.457652,
+      "initialized": 215.36354,
+      "probeSent": 215.414861,
+      "probeAnswered": 752.26396,
+      "exited": 781.258529
+    },
+    "result": {
+      "ordinaryUsageAllowed": true,
+      "rateLimits": {
+        "limitId": "codex",
+        "limitName": null,
+        "normalModelSlug": null,
+        "primary": {
+          "usedPercent": 0,
+          "windowDurationMins": 300,
+          "resetsAt": 1790088500
+        },
+        "secondary": {
+          "usedPercent": 13,
+          "windowDurationMins": 10080,
+          "resetsAt": 1790586920
+        },
+        "credits": {
+          "hasCredits": false,
+          "unlimited": false,
+          "balance": "0"
+        },
+        "individualLimit": null,
+        "spendControlReached": false,
+        "planType": "plus",
+        "rateLimitReachedType": null
+      },
+      "rateLimitsByLimitId": {
+        "codex": {
+          "limitId": "codex",
+          "limitName": null,
+          "normalModelSlug": null,
+          "primary": {
+            "usedPercent": 0,
+            "windowDurationMins": 300,
+            "resetsAt": 1790088500
+          },
+          "secondary": {
+            "usedPercent": 13,
+            "windowDurationMins": 10080,
+            "resetsAt": 1790586920
+          },
+          "credits": {
+            "hasCredits": false,
+            "unlimited": false,
+            "balance": "0"
+          },
+          "individualLimit": null,
+          "spendControlReached": false,
+          "planType": "plus",
+          "rateLimitReachedType": null
+        }
+      },
+      "rateLimitResetCredits": {
+        "availableCount": 0,
+        "credits": []
+      },
+      "accountId": "3ebc88b8-4aff-4245-a1b4-0a457f23c962",
+      "rateLimitUpsell": null
+    },
+    "err": null,
+    "code": 0,
+    "signal": null,
+    "stderr": "",
+    "pid": 2688798
+  },
+  {
+    "marks": {
+      "spawned": 1.361322,
+      "initSent": 1.408702,
+      "initialized": 217.028694,
+      "probeSent": 217.087015,
+      "probeAnswered": 763.591197,
+      "exited": 789.548479
+    },
+    "result": {
+      "ordinaryUsageAllowed": true,
+      "rateLimits": {
+        "limitId": "codex",
+        "limitName": null,
+        "normalModelSlug": null,
+        "primary": {
+          "usedPercent": 0,
+          "windowDurationMins": 300,
+          "resetsAt": 1790088500
+        },
+        "secondary": {
+          "usedPercent": 13,
+          "windowDurationMins": 10080,
+          "resetsAt": 1790586920
+        },
+        "credits": {
+          "hasCredits": false,
+          "unlimited": false,
+          "balance": "0"
+        },
+        "individualLimit": null,
+        "spendControlReached": false,
+        "planType": "plus",
+        "rateLimitReachedType": null
+      },
+      "rateLimitsByLimitId": {
+        "codex": {
+          "limitId": "codex",
+          "limitName": null,
+          "normalModelSlug": null,
+          "primary": {
+            "usedPercent": 0,
+            "windowDurationMins": 300,
+            "resetsAt": 1790088500
+          },
+          "secondary": {
+            "usedPercent": 13,
+            "windowDurationMins": 10080,
+            "resetsAt": 1790586920
+          },
+          "credits": {
+            "hasCredits": false,
+            "unlimited": false,
+            "balance": "0"
+          },
+          "individualLimit": null,
+          "spendControlReached": false,
+          "planType": "plus",
+          "rateLimitReachedType": null
+        }
+      },
+      "rateLimitResetCredits": {
+        "availableCount": 0,
+        "credits": []
+      },
+      "accountId": "3ebc88b8-4aff-4245-a1b4-0a457f23c962",
+      "rateLimitUpsell": null
+    },
+    "err": null,
+    "code": 0,
+    "signal": null,
+    "stderr": "",
+    "pid": 2689034
+  },
+  {
+    "marks": {
+      "spawned": 1.353982,
+      "initSent": 1.402892,
+      "initialized": 213.976828,
+      "probeSent": 214.046708,
+      "probeAnswered": 1073.892178,
+      "exited": 1100.053424
+    },
+    "result": {
+      "ordinaryUsageAllowed": true,
+      "rateLimits": {
+        "limitId": "codex",
+        "limitName": null,
+        "normalModelSlug": null,
+        "primary": {
+          "usedPercent": 0,
+          "windowDurationMins": 300,
+          "resetsAt": 1790088500
+        },
+        "secondary": {
+          "usedPercent": 13,
+          "windowDurationMins": 10080,
+          "resetsAt": 1790586921
+        },
+        "credits": {
+          "hasCredits": false,
+          "unlimited": false,
+          "balance": "0"
+        },
+        "individualLimit": null,
+        "spendControlReached": false,
+        "planType": "plus",
+        "rateLimitReachedType": null
+      },
+      "rateLimitsByLimitId": {
+        "codex": {
+          "limitId": "codex",
+          "limitName": null,
+          "normalModelSlug": null,
+          "primary": {
+            "usedPercent": 0,
+            "windowDurationMins": 300,
+            "resetsAt": 1790088500
+          },
+          "secondary": {
+            "usedPercent": 13,
+            "windowDurationMins": 10080,
+            "resetsAt": 1790586921
+          },
+          "credits": {
+            "hasCredits": false,
+            "unlimited": false,
+            "balance": "0"
+          },
+          "individualLimit": null,
+          "spendControlReached": false,
+          "planType": "plus",
+          "rateLimitReachedType": null
+        }
+      },
+      "rateLimitResetCredits": {
+        "availableCount": 0,
+        "credits": []
+      },
+      "accountId": "3ebc88b8-4aff-4245-a1b4-0a457f23c962",
+      "rateLimitUpsell": null
+    },
+    "err": null,
+    "code": 0,
+    "signal": null,
+    "stderr": "",
+    "pid": 2689253
+  }
+]
