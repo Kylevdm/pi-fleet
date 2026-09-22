@@ -850,6 +850,10 @@ function defaultSupervisorSpawner(storeRoot: string, jobId: string): void {
  * Returns once the process has exited or the ladder is complete.
  */
 async function terminatePi(pid: number): Promise<void> {
+  // A pid of 0 or -1 is not a process: POSIX reads them as "my process group"
+  // and "every process I may signal". Cancelling one job must never be able to
+  // signal anything but that job's child.
+  if (!Number.isInteger(pid) || pid <= 1) return;
   try {
     process.kill(pid, "SIGTERM");
   } catch {

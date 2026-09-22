@@ -176,10 +176,10 @@ async function runJob(
     return;
   }
 
-  // Record the driver's call intent and discovered session for later reads.
-  if (run.sessionFile !== null) {
-    await store.writePiPid(jobId, -1).catch(() => {}); // placeholder; ticket 25 has no pid
-  }
+  // No pid is recorded: the driver owns the spawn and does not expose the
+  // child's pid yet. Writing a placeholder is worse than writing nothing —
+  // cancel signals whatever the pid file says, and a non-positive pid is a
+  // broadcast, not a process.
 
   // Release capacity before mutating the job record.
   await store.releaseCapacity(jobId);

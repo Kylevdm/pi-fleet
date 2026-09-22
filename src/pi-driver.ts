@@ -814,9 +814,11 @@ export async function runStage(opts: RunStageOptions): Promise<RunResult> {
   // resource is missing. We classify it as such and bail out so the
   // supervisor never sees an unhandled exception. The call intent has
   // already been written — durable evidence of the attempt.
-  let spawnError: Error | null = null;
+  // Held in an object rather than a bare `let` so the assignment inside
+  // the listener stays visible to the typechecker at the read below.
+  const spawnFailure: { error: Error | null } = { error: null };
   child.once("error", (err: Error) => {
-    spawnError = err;
+    spawnFailure.error = err;
   });
 
   // 3. Consume the event stream with LF-only framing.
@@ -859,162 +861,179 @@ export async function runStage(opts: RunStageOptions): Promise<RunResult> {
   // 4. Launch timeout.
   let launchTimer: NodeJS.Timeout | null = null;
   let stageTimer: NodeJS.Timeout | null = null;
+  let launchInterval: NodeJS.Timeout | null = null;
+  let stageInterval: NodeJS.Timeout | null = null;
   let terminateRung: TerminateRung = "none";
+
+  // Both waits poll a flag and race a deadline. Whichever arm wins, the
+  // losing arm's handle is still armed, so every exit path below has to
+  // go through clearTimers() — a leaked 50ms interval (or the one-hour
+  // stage deadline) keeps the event loop alive long after the stage is
+  // done, which in a long-lived supervisor accumulates per run.
+  const clearTimers = (): void => {
+    if (launchTimer !== null) clearTimeout(launchTimer);
+    if (stageTimer !== null) clearTimeout(stageTimer);
+    if (launchInterval !== null) clearInterval(launchInterval);
+    if (stageInterval !== null) clearInterval(stageInterval);
+  };
 
   const launchPromise = new Promise<"launched" | "timeout">((resolve) => {
     launchTimer = setTimeout(() => resolve("timeout"), launchTimeoutMs);
-    const interval = setInterval(() => {
+    const poll = setInterval(() => {
       if (agentStartSeen) {
-        clearInterval(interval);
+        clearInterval(poll);
         resolve("launched");
       }
     }, 50);
+    launchInterval = poll;
     // Watch for an early exit.
     child.once("exit", () => {
-      clearInterval(interval);
+      clearInterval(poll);
       resolve(agentStartSeen ? "launched" : "timeout");
     });
   });
 
   const stagePromise = new Promise<"settled" | "killed" | "exit">((resolve) => {
     stageTimer = setTimeout(() => resolve("killed"), stageTimeoutMs);
-    const interval = setInterval(() => {
+    const poll = setInterval(() => {
       if (settled) {
-        clearInterval(interval);
+        clearInterval(poll);
         resolve("settled");
       }
     }, 50);
+    stageInterval = poll;
     child.once("exit", () => {
-      clearInterval(interval);
+      clearInterval(poll);
       resolve("exit");
     });
   });
 
-  const launched = await launchPromise;
-  if (launchTimer !== null) clearTimeout(launchTimer);
-  if (spawnError !== null) {
-    // Spawn failed. The child never produced output; the call intent
-    // is already on disk. This is infrastructure: the binary path was
-    // bad or the host could not exec it.
+  try {
+    const launched = await launchPromise;
+    if (spawnFailure.error !== null) {
+      // Spawn failed. The child never produced output; the call intent
+      // is already on disk. This is infrastructure: the binary path was
+      // bad or the host could not exec it.
+      if (eventsFile !== null) await eventsFile.close().catch(() => {});
+      return {
+        inputProblem: null,
+        outcome: { kind: "infra", reason: `spawn failed: ${spawnFailure.error.message}`, summary: summarise(collected), events: collected },
+        terminateRung: "none",
+        sessionFile: null,
+        sessionBytes: 0,
+        callIntentPath,
+        piVersion,
+      };
+    }
+    if (!agentStartSeen && launched === "timeout") {
+      // No agent_start within launchTimeoutMs. This is an infrastructure
+      // failure: classify and stop. The ladder still runs to record the rung.
+      terminateRung = await terminate(child, { sigtermToSigkillMs: 30_000 });
+      if (eventsFile !== null) await eventsFile.close().catch(() => {});
+      const summary = summarise(collected);
+      return {
+        inputProblem: null,
+        outcome: { kind: "infra", reason: `launch timeout after ${launchTimeoutMs}ms`, summary, events: collected },
+        terminateRung,
+        sessionFile: null,
+        sessionBytes: 0,
+        callIntentPath,
+        piVersion,
+      };
+    }
+
+    const stopped = await stagePromise;
+
+    if (stopped === "killed") {
+      terminateRung = await terminate(child, { sigtermToSigkillMs: 30_000 });
+    }
+
     if (eventsFile !== null) await eventsFile.close().catch(() => {});
-    return {
-      inputProblem: null,
-      outcome: { kind: "infra", reason: `spawn failed: ${spawnError.message}`, summary: summarise(collected), events: collected },
-      terminateRung: "none",
-      sessionFile: null,
-      sessionBytes: 0,
-      callIntentPath,
-      piVersion,
-    };
-  }
-  if (!agentStartSeen && launched === "timeout") {
-    // No agent_start within launchTimeoutMs. This is an infrastructure
-    // failure: classify and stop. The ladder still runs to record the rung.
-    terminateRung = await terminate(child, { sigtermToSigkillMs: 30_000 });
-    if (stageTimer !== null) clearTimeout(stageTimer);
-    if (eventsFile !== null) await eventsFile.close().catch(() => {});
-    const summary = summarise(collected);
-    return {
-      inputProblem: null,
-      outcome: { kind: "infra", reason: `launch timeout after ${launchTimeoutMs}ms`, summary, events: collected },
-      terminateRung,
-      sessionFile: null,
-      sessionBytes: 0,
-      callIntentPath,
-      piVersion,
-    };
-  }
 
-  const stopped = await stagePromise;
-  if (stageTimer !== null) clearTimeout(stageTimer);
-
-  if (stopped === "killed") {
-    terminateRung = await terminate(child, { sigtermToSigkillMs: 30_000 });
-  }
-
-  if (eventsFile !== null) await eventsFile.close().catch(() => {});
-
-  // Wait for the child to fully exit (it may still be flushing).
-  if (child.exitCode === null) {
-    await new Promise<void>((resolve) => {
-      const t = setTimeout(resolve, 5_000);
-      child.once("exit", () => {
-        clearTimeout(t);
-        resolve();
+    // Wait for the child to fully exit (it may still be flushing).
+    if (child.exitCode === null) {
+      await new Promise<void>((resolve) => {
+        const t = setTimeout(resolve, 5_000);
+        child.once("exit", () => {
+          clearTimeout(t);
+          resolve();
+        });
       });
-    });
-  }
+    }
 
-  // 5. Discover session file.
-  const sessionFile = await discoverSessionFile(opts.sessionDir, session);
-  const sessionBytes = await sessionFileBytes(sessionFile);
+    // 5. Discover session file.
+    const sessionFile = await discoverSessionFile(opts.sessionDir, session);
+    const sessionBytes = await sessionFileBytes(sessionFile);
 
-  // 6. Caps.
-  if (sessionBytes > ATTEMPT_TRANSCRIPT_CAP_BYTES) {
+    // 6. Caps.
+    if (sessionBytes > ATTEMPT_TRANSCRIPT_CAP_BYTES) {
+      const summary = summarise(collected);
+      return {
+        inputProblem: null,
+        outcome: { kind: "quality", reason: `attempt transcript over ${ATTEMPT_TRANSCRIPT_CAP_BYTES} bytes`, summary, events: collected },
+        terminateRung,
+        sessionFile,
+        sessionBytes,
+        callIntentPath,
+        piVersion,
+      };
+    }
+    if (sessionBytes > JOB_TRANSCRIPT_CAP_BYTES) {
+      const summary = summarise(collected);
+      return {
+        inputProblem: null,
+        outcome: { kind: "quality", reason: `job transcript over ${JOB_TRANSCRIPT_CAP_BYTES} bytes`, summary, events: collected },
+        terminateRung,
+        sessionFile,
+        sessionBytes,
+        callIntentPath,
+        piVersion,
+      };
+    }
+
+    // 7. Classify.
     const summary = summarise(collected);
-    return {
-      inputProblem: null,
-      outcome: { kind: "quality", reason: `attempt transcript over ${ATTEMPT_TRANSCRIPT_CAP_BYTES} bytes`, summary, events: collected },
-      terminateRung,
-      sessionFile,
-      sessionBytes,
-      callIntentPath,
-      piVersion,
-    };
-  }
-  if (sessionBytes > JOB_TRANSCRIPT_CAP_BYTES) {
-    const summary = summarise(collected);
-    return {
-      inputProblem: null,
-      outcome: { kind: "quality", reason: `job transcript over ${JOB_TRANSCRIPT_CAP_BYTES} bytes`, summary, events: collected },
-      terminateRung,
-      sessionFile,
-      sessionBytes,
-      callIntentPath,
-      piVersion,
-    };
-  }
-
-  // 7. Classify.
-  const summary = summarise(collected);
-  const validated = summary.sealed !== null ? validateSubmitPayload(summary.sealed) : null;
-  if (summary.sealed !== null && validated !== null && validated.ok && summary.sealedTool !== null) {
-    // The stage sealed: scrub the session file in place. The spec says
-    // "scrubbed at seal and at egress"; this is the seal step. Egress
-    // scrubbing is the consumer's job (the supervisor / a report).
-    if (sessionFile !== null) {
-      await scrubSessionFile(sessionFile);
+    const validated = summary.sealed !== null ? validateSubmitPayload(summary.sealed) : null;
+    if (summary.sealed !== null && validated !== null && validated.ok && summary.sealedTool !== null) {
+      // The stage sealed: scrub the session file in place. The spec says
+      // "scrubbed at seal and at egress"; this is the seal step. Egress
+      // scrubbing is the consumer's job (the supervisor / a report).
+      if (sessionFile !== null) {
+        await scrubSessionFile(sessionFile);
+      }
+      return {
+        inputProblem: null,
+        outcome: { kind: "sealed", tool: summary.sealedTool, payload: summary.sealed, summary, events: collected },
+        terminateRung,
+        sessionFile,
+        sessionBytes,
+        callIntentPath,
+        piVersion,
+      };
+    }
+    if (summary.agentStarted) {
+      return {
+        inputProblem: null,
+        outcome: { kind: "quality", reason: validated?.reason ?? "no sealed submit_*", summary, events: collected },
+        terminateRung,
+        sessionFile,
+        sessionBytes,
+        callIntentPath,
+        piVersion,
+      };
     }
     return {
       inputProblem: null,
-      outcome: { kind: "sealed", tool: summary.sealedTool, payload: summary.sealed, summary, events: collected },
+      outcome: { kind: "infra", reason: "no agent_start observed", summary, events: collected },
       terminateRung,
       sessionFile,
       sessionBytes,
       callIntentPath,
       piVersion,
     };
+  } finally {
+    clearTimers();
   }
-  if (summary.agentStarted) {
-    return {
-      inputProblem: null,
-      outcome: { kind: "quality", reason: validated?.reason ?? "no sealed submit_*", summary, events: collected },
-      terminateRung,
-      sessionFile,
-      sessionBytes,
-      callIntentPath,
-      piVersion,
-    };
-  }
-  return {
-    inputProblem: null,
-    outcome: { kind: "infra", reason: "no agent_start observed", summary, events: collected },
-    terminateRung,
-    sessionFile,
-    sessionBytes,
-    callIntentPath,
-    piVersion,
-  };
 }
 
 /** Minimal atomic JSON write — same shape as the store's writeJsonFile. */
