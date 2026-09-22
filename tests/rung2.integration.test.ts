@@ -7,6 +7,15 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { JobStore, Paths } from "../src/store/job-store.ts";
 
+// The production stage timeouts are 90s to launch and an hour of wall clock.
+// This suite drives a fixture-replaying stub, so it tightens both: a slow
+// stage here is a slow test, and a stub still running when a test ends
+// lingers, since cancel has no pid to signal. Set on process.env so the
+// spawned CLI and its detached supervisor inherit it.
+process.env.PI_FLEET_LAUNCH_TIMEOUT_MS = "5000";
+process.env.PI_FLEET_STAGE_TIMEOUT_MS = "30000";
+
+
 const binary = fileURLToPath(new URL("../bin/fleet", import.meta.url));
 
 type Run = { code: number | null; signal: string | null; stdout: string; stderr: string };
