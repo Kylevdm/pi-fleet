@@ -49,6 +49,12 @@ parent issue.
 such as scouting, planning, implementation, or review. A work unit is not
 published to the issue tracker. _Avoid_: ticket, subtask.
 
+**Role**: the kind of work a dispatch is routed for — writer, reviewer, or
+helper, with scout and planner on the discovery path. It is what a model is
+eligible for and what its evidence is grouped by. It is not a stage: checking
+has a stage but no role, a helper has a role but no stage, and an escalated
+writer is still a writer. _Avoid_: agent type, stage, task class.
+
 **Input snapshot**: the immutable issue or request context captured for a
 fleet job before delegated work begins. Fleet acquires it itself from a bare
 ticket reference rather than receiving it from the primary orchestrator, so its
@@ -102,11 +108,17 @@ instructions cannot be weakened by a delegated agent. Planners and reviewers
 may add checks. Fleet automatically runs only repository-defined, documented,
 or explicitly allowlisted commands; external mutations stay reserved.
 
-**Risk class**: the minimum scrutiny and starting model tier for a fleet job.
-Low-risk work is mechanical or tightly bounded with deterministic checks;
-medium-risk work may span files or alter behavior whose intent is already
-decided; reserved work stays with the primary orchestrator. A delegated agent
-may raise the initial class but never lower it. _Avoid_: difficulty, model tier.
+**Risk class**: a fleet job's only classification, `low` or `medium`, setting
+both its minimum scrutiny and its starting model tier. Low-risk work is
+mechanical or tightly bounded with deterministic checks; medium-risk work may
+span files or alter behavior whose intent is already decided; reserved work
+stays with the primary orchestrator. The primary orchestrator supplies it and
+no model is dispatched to classify; Fleet and delegated agents may raise it but
+never lower it. _Avoid_: difficulty, task class, model tier.
+
+**Sensitive path**: a repository path, listed by a human, whose appearance in a
+writer's sealed diff raises the fleet job to `medium`. _Avoid_: protected path,
+risky file.
 
 **Brief**: the prompt that assigns a work unit to a delegated agent. Because
 the harness reads the repository's own conventions, briefs can stay terse.
