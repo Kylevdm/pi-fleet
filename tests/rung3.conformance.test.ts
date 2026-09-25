@@ -161,7 +161,8 @@ describe("rung 3 conformance", () => {
         const view = got.envelope as Record<string, unknown>;
         assert.strictEqual(view.objective, "round trip");
         assert.strictEqual(view.risk, "low");
-        assert.strictEqual(view.status, "admitted");
+        // A detached supervisor may claim the job between submit and get.
+        assert.ok(["admitted", "running"].includes(view.status as string));
         assert.deepStrictEqual(view.next, ["get", "wait", "cancel"]);
       });
 

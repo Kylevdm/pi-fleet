@@ -558,13 +558,16 @@ describe("ticket 26 rung 2 integration", () => {
     return false;
   }
 
-  it("submit returns before the supervisor finishes (status is admitted immediately)", async () => {
+  it("submit returns before the supervisor finishes", async () => {
     const home = mkdtempSync(join(tmpdir(), "fleet-r26-submit-"));
     const repo = mkdtempSync(join(tmpdir(), "fleet-r26-repo-"));
     mkdirSync(join(repo, ".git"));
     const { jobId } = await submitJob(home, repo);
     const view = await getJob(home, jobId);
-    assert.strictEqual(view.status, "admitted");
+    // The detached supervisor may already have claimed the job; what it
+    // cannot have done yet is seal the stage.
+    assert.ok(["admitted", "running"].includes(view.status as string));
+    assert.notStrictEqual(view.stageState, "sealed");
   });
 
   it("SIGKILL of the supervisor mid-stage resumes from the last seal", async () => {
